@@ -1,0 +1,19 @@
+{
+  "name": "j-lexicon-ai",
+  "version": "1.0.0",
+  "description": "Japanese Dictionary & Anki Bridge Extension with Jitendex & Gemini AI",
+  "scripts": {
+    "setup:dict": "python3 scripts/download_jitendex.py",
+    "download:jitendex": "python3 scripts/download_jitendex.py",
+    "build:hanviet": "python3 scripts/build_hanviet.py"
+  },
+  "keywords": [
+    "japanese",
+    "dictionary",
+    "jitendex",
+    "anki",
+    "gemini"
+  ],
+  "author": "",
+  "license": "MIT"
+}

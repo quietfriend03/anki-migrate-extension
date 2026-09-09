@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "J-Lexicon AI - Japanese Dictionary & Anki Bridge",
+  "version": "1.0.0",
+  "description": "Tra cứu từ điển tiếng Nhật từ Jitendex, hiển thị âm Hán-Việt, phát âm, sinh ví dụ với Gemini AI và lưu thẻ vào Anki.",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://localhost:8765/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://dict.youdao.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "J-Lexicon AI",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/content-script.js"
+      ],
+      "css": [
+        "content/content-style.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "data/hanviet.json",
+        "dictionaries/*",
+        "dictionaries/jitendex/*",
+        "assets/icons/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Cài Đặt J-Lexicon AI Extension</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="brand">
+        <span class="logo-badge">J</span>
+        <div>
+          <h1>J-Lexicon AI</h1>
+          <p class="subtitle">Japanese Dictionary, Han-Viet, Gemini AI & Anki Bridge</p>
+        </div>
+      </div>
+      <a href="https://github.com/Jitendex/Jitendex" target="_blank" class="header-link">Tải từ điển Jitendex ↗</a>
+    </header>
+
+    <div class="tabs-nav">
+      <button class="tab-btn active" data-tab="dict-tab">📚 Quản Lý Từ Điển</button>
+      <button class="tab-btn" data-tab="gemini-tab">✨ Gemini AI</button>
+      <button class="tab-btn" data-tab="anki-tab">🗂️ Kết Nối Anki</button>
+      <button class="tab-btn" data-tab="general-tab">⚙️ Phím Tắt & Chung</button>
+    </div>
+
+    <!-- TAB 1: DICTIONARY -->
+    <div id="dict-tab" class="tab-content active">
+      <div class="card">
+        <h2>Trạng Thái Bộ Từ Điển</h2>
+        <div class="stats-grid">
+          <div class="stat-box">
+            <span class="stat-label">Tổng số từ vựng trong IndexedDB</span>
+            <span id="stat-total-terms" class="stat-value">0</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Cập nhật lần cuối</span>
+            <span id="stat-last-updated" class="stat-value text-sm">Chưa có dữ liệu</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Nạp Dữ Liệu Jitendex</h2>
+        <p class="desc">
+          Jitendex là bộ từ điển Nhật - Anh mã nguồn mở chất lượng cao (tương thích Yomitan/Yomichan). Dữ liệu được lưu trữ trực tiếp trong cơ sở dữ liệu IndexedDB của trình duyệt để tra cứu ngoại tuyến (offline) siêu tốc.
+        </p>
+
+        <!-- CÁCH 1: AUTO DOWNLOAD 1-CLICK TỪ GITHUB -->
+        <div class="auto-download-box" style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 260px;">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                <span style="font-size: 20px;">🚀</span>
+                <strong style="color: #166534; font-size: 15px;">Cách 1: Tải & Cài Đặt Tự Động (1-Click)</strong>
+                <span style="background: #16a34a; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;">KHUYÊN DÙNG</span>
+              </div>
+              <p style="margin: 0; font-size: 13px; color: #374151; line-height: 1.4;">
+                Tiện ích sẽ tự động tải bản <code>jitendex-yomitan.zip</code> (~60MB) từ GitHub, giải nén trong bộ nhớ và nạp trực tiếp vào IndexedDB. Bạn không cần tải file về máy tính!
+              </p>
+            </div>
+            <button id="btn-auto-download" class="btn btn-primary" style="background: #16a34a; border-color: #15803d; padding: 12px 22px; font-size: 15px; font-weight: 700; white-space: nowrap; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.35); cursor: pointer;">
+              ⬇️ TẢI & CÀI ĐẶT JITENDEX (1-CLICK)
+            </button>
+          </div>
+
+          <!-- Advanced URL customize toggle -->
+          <div style="margin-top: 10px; font-size: 12px;">
+            <details style="cursor: pointer; color: #4b5563;">
+              <summary style="user-select: none;">⚙️ Tùy chỉnh link tải từ điển (Mặc định: GitHub Jitendex)</summary>
+              <div style="margin-top: 8px; display: flex; gap: 8px;">
+                <input type="text" id="auto-download-url" style="flex: 1; font-size: 12px; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px;" value="https://github.com/stephenmk/stephenmk.github.io/releases/latest/download/jitendex-yomitan.zip">
+                <button type="button" id="btn-reset-download-url" class="btn btn-secondary" style="font-size: 11px; padding: 4px 10px;">Đặt lại</button>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- CÁCH 2: NẠP TỪ THƯ MỤC LOCAL DỰ ÁN (HIỆN NẾU TÌM THẤY) -->
+        <div id="local-dict-box" style="display: none; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 14px; margin-bottom: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <div>
+              <strong style="color: #1e40af; display: block; margin-bottom: 4px;">📂 Phát Hiện Dữ Liệu Trong Thư Mục Dự Án</strong>
+              <span style="font-size: 13px; color: #374151;">Tìm thấy file từ điển trong thư mục <code>dictionaries/jitendex/</code> (tải sẵn qua lệnh terminal).</span>
+            </div>
+            <button id="btn-load-local-dict" class="btn btn-primary" style="background: #2563eb; border-color: #1d4ed8; white-space: nowrap; padding: 8px 14px; font-size: 13px; font-weight: 600;">
+              ⚡ Nạp Ngay Vào Tiện Ích
+            </button>
+          </div>
+        </div>
+
+        <!-- CÁCH 2: KÉO THẢ FILE THỦ CÔNG -->
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <strong style="color: #374151; font-size: 14px;">📁 Cách 2: Kéo Thả File .zip Hoặc .json Thủ Công</strong>
+        </div>
+
+        <div class="file-dropzone" id="dropzone">
+          <input type="file" id="file-input" accept=".zip,.json" multiple>
+          <div class="dropzone-content">
+            <span class="dropzone-icon">📥</span>
+            <span class="dropzone-text">Kéo thả file <strong>.zip</strong> hoặc <strong>.json</strong> vào đây</span>
+            <span class="dropzone-sub">hoặc nhấn để duyệt file từ máy tính</span>
+          </div>
+        </div>
+
+        <div id="import-progress-container" class="progress-section" style="display: none;">
+          <div class="progress-bar-bg">
+            <div id="import-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+          </div>
+          <p id="import-status-text" class="progress-status">Đang nạp: 0%...</p>
+        </div>
+
+        <div class="action-buttons-row">
+          <button id="btn-clear-db" class="btn btn-danger">
+            🗑️ Xóa Toàn Bộ Từ Điển
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: GEMINI AI -->
+    <div id="gemini-tab" class="tab-content">
+      <div class="card">
+        <h2>Cấu Hình Google AI Studio (Gemini)</h2>
+        <p class="desc">
+          Nhập Gemini API Key miễn phí từ <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio ↗</a> để kích hoạt tính năng sinh câu ví dụ ngữ cảnh có Furigana và dịch tiếng Việt.
+        </p>
+
+        <div class="form-group">
+          <label for="gemini-api-key">Gemini API Key:</label>
+          <div class="input-password-row">
+            <input type="password" id="gemini-api-key" placeholder="AIzaSy...">
+            <button type="button" id="btn-toggle-key" class="btn btn-small">👁️ Hiện</button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="gemini-model">Mô hình AI (Model):</label>
+          <div style="display: flex; gap: 8px;">
+            <select id="gemini-model" style="flex: 1;">
+              <option value="gemini-2.5-flash" selected>gemini-2.5-flash (Khuyên dùng: Siêu nhanh, phản hồi tức thì)</option>
+              <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview (Mô hình Pro thế hệ mới nhất)</option>
+              <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+            </select>
+            <button type="button" id="btn-fetch-models" class="btn btn-secondary btn-small" title="Tải danh sách model mà API Key của bạn hỗ trợ">🔄 Quét Model</button>
+          </div>
+          <span class="help-text">Nhấn "Quét Model" để tự động nhận diện chính xác các model mà tài khoản của bạn được cấp quyền.</span>
+        </div>
+
+        <div class="form-group">
+          <label for="gemini-prompt">Tùy chỉnh Prompt sinh ví dụ:</label>
+          <textarea id="gemini-prompt" rows="5" placeholder="Hãy tạo 1 câu ví dụ cho từ {word}..."></textarea>
+          <span class="help-text">Biến hỗ trợ: <code>{word}</code>, <code>{reading}</code>, <code>{definition}</code>.</span>
+        </div>
+
+        <div class="action-buttons-row">
+          <button id="btn-save-gemini" class="btn btn-primary">Lưu Cấu Hình Gemini</button>
+          <button id="btn-test-gemini" class="btn btn-secondary">Kiểm Tra Kết Nối AI</button>
+        </div>
+        <div id="gemini-test-result" class="alert-box" style="display: none;"></div>
+      </div>
+    </div>
+
+    <!-- TAB 3: ANKI -->
+    <div id="anki-tab" class="tab-content">
+      <div class="card">
+        <h2>Cấu Hình AnkiConnect</h2>
+        <p class="desc">
+          Yêu cầu đã cài plugin <strong>AnkiConnect</strong> (Code: <code>2055492159</code>) trên ứng dụng Anki máy tính và đang mở Anki.
+        </p>
+
+        <div class="form-group">
+          <label for="anki-url">AnkiConnect URL:</label>
+          <input type="text" id="anki-url" value="http://localhost:8765">
+        </div>
+
+        <div class="action-buttons-row">
+          <button id="btn-test-anki" class="btn btn-secondary">🔌 Kiểm Tra Kết Nối & Tải Danh Sách Deck</button>
+        </div>
+        <div id="anki-test-result" class="alert-box" style="display: none;"></div>
+
+        <!-- Anki Live Info Card -->
+        <div id="anki-info-card" class="anki-info-card" style="display: none; margin-top: 14px;">
+          <div class="anki-info-header">
+            <span class="anki-info-badge">🟢 Đã Kết Nối Anki</span>
+            <span id="anki-summary-pill" class="anki-pill">67 Bộ Thẻ • 6 Loại Thẻ</span>
+          </div>
+          <div id="anki-selected-deck-detail" class="anki-deck-detail" style="margin-top: 6px;">
+            Đang chọn lưu vào bộ thẻ: <strong id="current-deck-name-badge">Chưa chọn</strong>
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 18px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <label for="anki-deck-select" style="margin-bottom: 0;">Tên Bộ Thẻ (Deck Name):</label>
+            <button type="button" id="btn-toggle-custom-deck" class="btn-text-action">✏️ Nhập tên khác</button>
+          </div>
+          <select id="anki-deck-select" style="display: block; width: 100%;">
+            <option value="">-- Bấm "Kiểm Tra Kết Nối" để tải danh sách 67 Deck --</option>
+          </select>
+          <input type="text" id="anki-deck" placeholder="Japanese_Learning" style="display: none; width: 100%;">
+          <span class="help-text" id="deck-help-text">Chọn 1 trong các bộ thẻ có sẵn trên Anki để tự động lưu từ vựng vào đó.</span>
+        </div>
+
+        <div class="form-group">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <label for="anki-model-select" style="margin-bottom: 0;">Loại Thẻ (Note Type / Model):</label>
+            <button type="button" id="btn-toggle-custom-model" class="btn-text-action">✏️ Nhập tên khác</button>
+          </div>
+          <select id="anki-model-select" style="display: block; width: 100%;">
+            <option value="">-- Bấm "Kiểm Tra Kết Nối" để tải Loại Thẻ --</option>
+          </select>
+          <input type="text" id="anki-model" placeholder="Japanese_Model" style="display: none; width: 100%;">
+          <span class="help-text" id="model-help-text">Tự động phát hiện và ánh xạ các trường (Fields) của Loại Thẻ được chọn.</span>
+        </div>
+
+        <h3 style="margin-top: 20px; font-size: 15px;">Ánh Xạ Tên Trường (Field Mapping)</h3>
+        <p class="desc" id="field-mapping-desc">Tên các trường tương ứng trong Note Type trên Anki của bạn:</p>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Từ vựng (Word):</label>
+            <input type="text" id="field-word" value="Word">
+          </div>
+          <div class="form-group">
+            <label>Cách đọc (Reading):</label>
+            <input type="text" id="field-reading" value="Reading">
+          </div>
+          <div class="form-group">
+            <label>Âm Hán Việt (HanViet):</label>
+            <input type="text" id="field-hanviet" value="HanViet">
+          </div>
+          <div class="form-group">
+            <label>Nghĩa từ điển (Definition):</label>
+            <input type="text" id="field-definition" value="Definition">
+          </div>
+          <div class="form-group">
+            <label>Câu ví dụ (Example):</label>
+            <input type="text" id="field-example" value="Example">
+          </div>
+          <div class="form-group">
+            <label>Phát âm (Audio):</label>
+            <input type="text" id="field-audio" value="Audio">
+          </div>
+        </div>
+
+        <!-- LINGUIST 1-CLICK NOTE TYPE SETUP -->
+        <div style="margin: 20px 0 16px; padding: 14px; background: #faf5ff; border: 1px solid #d8b4fe; border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 250px;">
+              <strong style="color: #6b21a8; font-size: 14px; display: block; margin-bottom: 3px;">✨ Template Thẻ Japanese Vocab (Linguist Anki Bridge)</strong>
+              <span style="font-size: 12.5px; color: #4b5563; line-height: 1.4; display: block;">
+                Tự động tạo Note Type <code>Japanese (Linguist)</code> chuẩn 5 trường (Expression, Audio, Meaning, Kanji, Picture) với giao diện Mặt trước & Mặt sau theo chuẩn <a href="https://github.com/silam741852963/linguist-anki-bridge/tree/main/src/linguist_anki_bridge/templates/japanese_vocab" target="_blank" style="color: #7e22ce; font-weight: 600;">linguist-anki-bridge ↗</a> vào Anki.
+              </span>
+            </div>
+            <button type="button" id="btn-setup-linguist" class="btn btn-primary" style="background: #9333ea; border-color: #7e22ce; padding: 9px 16px; font-size: 13px; font-weight: 600; white-space: nowrap;">
+              🎨 Cài Đặt Note Type Vào Anki
+            </button>
+          </div>
+          <div id="linguist-setup-result" class="result-message" style="display: none; margin-top: 10px;"></div>
+        </div>
+
+        <div class="action-buttons-row">
+          <button id="btn-save-anki" class="btn btn-primary">Lưu Cấu Hình Anki</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: GENERAL & HOTKEYS -->
+    <div id="general-tab" class="tab-content">
+      <div class="card">
+        <h2>Phím Tắt & Trải Nghiệm Tra Cứu</h2>
+
+        <div class="form-group">
+          <label for="trigger-key">Phím Kích Hoạt Khi Rê Chuột (Hover):</label>
+          <select id="trigger-key">
+            <option value="Shift" selected>Phím Shift (Mặc định: Shift + Rê chuột)</option>
+            <option value="Alt">Phím Alt / Option (Alt + Rê chuột)</option>
+            <option value="Ctrl">Phím Ctrl / Command</option>
+            <option value="none">Không dùng rê chuột (Chỉ tra khi bôi đen / Selection)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="enable-scan" checked>
+            Bật tính năng quét từ khi rê chuột
+          </label>
+        </div>
+
+        <div class="form-group">
+          <label for="max-scan-length">Độ dài quét tối đa (ký tự):</label>
+          <input type="number" id="max-scan-length" min="4" max="30" value="16">
+        </div>
+
+        <div class="action-buttons-row">
+          <button id="btn-save-general" class="btn btn-primary">Lưu Cài Đặt Chung</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast">Đã lưu cài đặt!</div>
+  </div>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>

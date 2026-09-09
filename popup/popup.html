@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>J-Lexicon AI Popup</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-wrap">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <span class="logo">J</span>
+        <span class="title">J-Lexicon AI</span>
+      </div>
+      <button id="btn-open-options" class="icon-btn" title="Mở trang cài đặt">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+    </header>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <div class="status-pill" id="pill-dict">
+        <span class="dot"></span>
+        <span class="status-text" id="dict-count">Đang kiểm tra...</span>
+      </div>
+      <div class="status-pill" id="pill-anki">
+        <span class="dot"></span>
+        <span class="status-text" id="anki-status">Anki: ?</span>
+      </div>
+    </div>
+
+    <!-- Empty Dictionary Banner with 1-Click Install Button -->
+    <div id="dict-empty-banner" style="display: none; background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 12px; margin-bottom: 12px; text-align: center;">
+      <div style="font-size: 12px; color: #166534; font-weight: 600; margin-bottom: 8px;">
+        📖 Chưa có dữ liệu từ điển Jitendex
+      </div>
+      <button id="btn-popup-install-dict" style="background: #16a34a; color: white; border: none; border-radius: 6px; padding: 9px 12px; font-size: 13px; font-weight: 600; width: 100%; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 2px 4px rgba(22, 163, 74, 0.25);">
+        <span>🌐</span> Tải & Cài Đặt Jitendex (1-Click)
+      </button>
+    </div>
+
+    <!-- Quick Search -->
+    <div class="search-box">
+      <input type="text" id="quick-search-input" placeholder="Tra nhanh từ vựng (ví dụ: 食べる, 日本語)..." autofocus>
+      <button id="btn-quick-search" class="search-btn">Tìm</button>
+    </div>
+
+    <!-- Quick Settings Toggle -->
+    <div class="toggle-row">
+      <span>Quét từ khi rê chuột (Shift + Hover)</span>
+      <label class="switch">
+        <input type="checkbox" id="toggle-hover-scan" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <!-- Search Results Container -->
+    <div id="search-results" class="results-container"></div>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+/* J-Lexicon AI Root Container */
+#j-lexicon-root {
+  all: initial;
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2147483647;
+  pointer-events: auto;
+}
