@@ -151,26 +151,110 @@ async function translateToVietnamese(text, sourceLang = 'en') {
 }
 
 /**
+ * Helper: Extract clean Japanese text from a structured content node
+ */
+function extractJapaneseTextFromNode(node) {
+  if (!node) return '';
+  if (typeof node === 'string') {
+    return /[\u3040-\u30ff\u4e00-\u9faf]/.test(node) ? node : '';
+  }
+  if (Array.isArray(node)) {
+    return node.map(extractJapaneseTextFromNode).filter(Boolean).join('');
+  }
+  if (typeof node === 'object') {
+    if (node.tag === 'rt' || node.tag === 'rp') return ''; // Skip readings
+    if (node.lang === 'en' || node.lang === 'vi') return ''; // Skip translations
+    if (node.content !== undefined) {
+      return extractJapaneseTextFromNode(node.content);
+    }
+  }
+  return '';
+}
+
+/**
+ * Sanitize common machine-translation inaccuracies in Vietnamese
+ */
+function sanitizeVietnameseTranslation(viText, jaText = '') {
+  if (!viText || typeof viText !== 'string') return '';
+  let res = viText;
+
+  // 1. Fix "chuông báo thức" (alarm clock) when context is warning / railway / emergency
+  if (jaText && /警報|警告|踏切|サイレン|火災|警備/.test(jaText)) {
+    res = res.replace(/chuông báo thức/gi, 'chuông cảnh báo');
+    res = res.replace(/báo thức/gi, 'cảnh báo');
+  }
+
+  // 2. Fix railroad crossing terminology
+  if (jaText && /踏切/.test(jaText)) {
+    res = res.replace(/đường sắt/gi, 'đường ray');
+  }
+
+  // 3. Fix "rời đi" when context is "bên trái" (左)
+  if (jaText && /左/.test(jaText) && /rời đi/i.test(res)) {
+    res = res.replace(/rời đi/gi, 'bên trái');
+  }
+
+  // 4. Fix "đào tạo" when context is train (電車 / 列車)
+  if (jaText && /電車|列車/.test(jaText) && /đào tạo/i.test(res)) {
+    res = res.replace(/đào tạo/gi, 'tàu hỏa');
+  }
+
+  return res;
+}
+
+/**
+ * Translate an example sentence to Vietnamese, prioritizing the authentic Japanese sentence (sl=ja)
+ * rather than the English translation (sl=en) to preserve Kanji meanings and context.
+ */
+async function translateExampleSentenceToVietnamese({ ja = '', en = '' }) {
+  const cleanJa = (ja || '').replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+  let vi = '';
+
+  // 1. Translate directly from original Japanese sentence
+  if (cleanJa && /[\u3040-\u30ff\u4e00-\u9faf]/.test(cleanJa)) {
+    try {
+      vi = await translateToVietnamese(cleanJa, 'ja');
+    } catch (_) {}
+  }
+
+  // 2. Fallback to English translation if Japanese translation failed or was empty
+  if (!vi && en) {
+    const cleanEn = (en || '').replace(/<[^>]*>/g, '').trim();
+    if (cleanEn) {
+      try {
+        vi = await translateToVietnamese(cleanEn, 'en');
+      } catch (_) {}
+    }
+  }
+
+  return sanitizeVietnameseTranslation(vi || en, cleanJa);
+}
+
+/**
  * Recursively translate only example sentence translations in Structured Content to Vietnamese,
  * while keeping definitions, glossaries, notes, and tags in authentic English as in Jitendex.
  */
-async function translateExampleSentencesInNode(node, isInsideExample = false) {
+async function translateExampleSentencesInNode(node, isInsideExample = false, currentJa = '') {
   if (node === null || node === undefined) return node;
   if (typeof node === 'number') return node;
 
   if (typeof node === 'string') {
     if (isInsideExample && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(node) && node.trim().length > 1) {
-      return await translateToVietnamese(node, 'en');
+      return await translateExampleSentenceToVietnamese({ ja: currentJa, en: node });
     }
     return node;
   }
 
   if (Array.isArray(node)) {
-    return await Promise.all(node.map((child) => translateExampleSentencesInNode(child, isInsideExample)));
+    return await Promise.all(node.map((child) => translateExampleSentencesInNode(child, isInsideExample, currentJa)));
   }
 
   if (typeof node === 'object') {
     const isExampleNode = isInsideExample || (node.data && typeof node.data === 'object' && /example/i.test(node.data.content));
+    let jaText = currentJa;
+    if (isExampleNode && !jaText) {
+      jaText = extractJapaneseTextFromNode(node);
+    }
 
     // Part of speech badge formatting in English
     if (node.data && typeof node.data === 'object' && node.data.content === 'partOfSpeech') {
@@ -185,16 +269,16 @@ async function translateExampleSentencesInNode(node, isInsideExample = false) {
     if (isExampleNode && node.lang === 'en') {
       const newNode = { ...node, lang: 'vi' };
       if (typeof node.content === 'string') {
-        newNode.content = await translateToVietnamese(node.content, 'en');
+        newNode.content = await translateExampleSentenceToVietnamese({ ja: jaText, en: node.content });
       } else if (node.content !== undefined) {
-        newNode.content = await translateExampleSentencesInNode(node.content, true);
+        newNode.content = await translateExampleSentencesInNode(node.content, true, jaText);
       }
       return newNode;
     }
 
     const newNode = { ...node };
     if (node.content !== undefined) {
-      newNode.content = await translateExampleSentencesInNode(node.content, isExampleNode);
+      newNode.content = await translateExampleSentencesInNode(node.content, isExampleNode, jaText);
     }
     return newNode;
   }
@@ -1250,12 +1334,8 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
   for (const block of exBlocks) {
     const extracted = extractFromExampleBlock(block);
     if (extracted.jp) {
-      let viTrans = extracted.vi;
-      if (viTrans && !/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(viTrans)) {
-        try {
-          viTrans = await translateToVietnamese(viTrans, 'en');
-        } catch (_) {}
-      }
+      const cleanJp = extracted.jp.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+      let viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: extracted.vi });
       examples.push({ jp: extracted.jp, vi: viTrans });
     }
   }
@@ -1285,12 +1365,8 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
             trans = nextLine.replace(/\[\d+\]/g, '').trim();
             i++;
           }
-          let viTrans = trans;
-          if (viTrans && !/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(viTrans)) {
-            try {
-              viTrans = await translateToVietnamese(viTrans, 'en');
-            } catch (_) {}
-          }
+          const cleanJp = line.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+          let viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: trans });
           examples.push({ jp: line, vi: viTrans });
           break;
         }
@@ -1313,12 +1389,8 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
           trans = nextLine.replace(/\[\d+\]/g, '').trim();
           i++; // skip translation line
         }
-        let viTrans = trans;
-        if (viTrans && !/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(viTrans)) {
-          try {
-            viTrans = await translateToVietnamese(viTrans, 'en');
-          } catch (_) {}
-        }
+        const cleanJp = line.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+        let viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: trans });
         examples.push({ jp: line, vi: viTrans });
         continue;
       }

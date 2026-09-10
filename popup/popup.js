@@ -15,6 +15,8 @@ const ankiStatus = document.getElementById('anki-status');
 const dictEmptyBanner = document.getElementById('dict-empty-banner');
 const btnPopupInstallDict = document.getElementById('btn-popup-install-dict');
 
+let autoAiExamples = true;
+
 document.addEventListener('DOMContentLoaded', async () => {
   // Open options button
   btnOpenOptions.addEventListener('click', () => {
@@ -29,8 +31,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Load toggle state
-  const config = await chrome.storage.local.get({ enableScan: true, ankiUrl: 'http://localhost:8765' });
+  const config = await chrome.storage.local.get({ enableScan: true, ankiUrl: 'http://localhost:8765', autoAiExamples: true });
   toggleHoverScan.checked = config.enableScan;
+  autoAiExamples = config.autoAiExamples !== false;
 
   toggleHoverScan.addEventListener('change', async () => {
     await chrome.storage.local.set({ enableScan: toggleHoverScan.checked });
@@ -178,8 +181,7 @@ function renderResults(data) {
       </div>
       ` : ''}
 
-      ${!hasExample ? `
-      <div class="ai-example-box" style="margin: 8px 0 10px; padding: 10px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px;">
+      <div class="ai-example-box" style="margin: 8px 0 10px; padding: 10px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px; ${hasExample ? 'display: none;' : ''}">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
           <span style="font-size: 11px; font-weight: 700; color: #7e22ce; text-transform: uppercase;">✨ Ví dụ AI (Gemini)</span>
           <button type="button" class="btn-regen-ai" style="display: none; background: none; border: none; font-size: 11px; font-weight: 600; color: #9333ea; cursor: pointer; text-decoration: underline;">🔄 Đổi câu khác</button>
@@ -197,6 +199,13 @@ function renderResults(data) {
           </div>
           <div class="ai-error" style="display: none; font-size: 11px; color: #dc2626; margin-top: 4px;"></div>
         </div>
+      </div>
+
+      ${hasExample ? `
+      <div class="ai-toggle-wrap" style="margin: 6px 0 10px;">
+        <button type="button" class="btn-toggle-ai-ex" style="background: none; border: 1px dashed #c084fc; border-radius: 6px; padding: 4px 10px; font-size: 11.5px; font-weight: 600; color: #7e22ce; cursor: pointer; width: 100%; text-align: center;">
+          ✨ Tạo thêm câu ví dụ bằng AI (Gemini)
+        </button>
       </div>
       ` : ''}
 
@@ -344,6 +353,19 @@ function renderResults(data) {
 
       if (btnGen) btnGen.onclick = () => triggerGenerate(false);
       if (btnRegen) btnRegen.onclick = () => triggerGenerate(true);
+
+      const toggleAiBtn = card.querySelector('.btn-toggle-ai-ex');
+      if (toggleAiBtn) {
+        toggleAiBtn.onclick = () => {
+          aiBox.style.display = 'block';
+          toggleAiBtn.style.display = 'none';
+          triggerGenerate(false);
+        };
+      }
+
+      if (!hasExample && autoAiExamples) {
+        triggerGenerate(false);
+      }
     }
 
     // Anki Click

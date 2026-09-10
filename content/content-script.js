@@ -475,8 +475,7 @@
         ${defsListHtml}
       </ol>
 
-      ${!hasExample ? `
-      <div class="jlex-ai-example-box" style="margin: 10px 0; padding: 10px 12px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px;">
+      <div class="jlex-ai-example-box" style="margin: 10px 0; padding: 10px 12px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px; ${hasExample ? 'display: none;' : ''}">
         <div class="jlex-ai-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
           <span style="font-size: 11px; font-weight: 700; color: #7e22ce; text-transform: uppercase; letter-spacing: 0.5px;">✨ Ví dụ AI (Gemini)</span>
           <button type="button" class="jlex-btn-regen-ai" style="display: none; background: none; border: none; font-size: 11px; font-weight: 600; color: #9333ea; cursor: pointer; text-decoration: underline;">🔄 Đổi câu khác</button>
@@ -494,6 +493,13 @@
           </div>
           <div class="jlex-ai-error" style="display: none; font-size: 11.5px; color: #dc2626; margin-top: 4px; line-height: 1.4;"></div>
         </div>
+      </div>
+
+      ${hasExample ? `
+      <div class="jlex-ai-toggle-wrap" style="margin: 6px 0 10px;">
+        <button type="button" class="jlex-btn-toggle-ai" style="background: none; border: 1px dashed #c084fc; border-radius: 6px; padding: 4px 10px; font-size: 11.5px; font-weight: 600; color: #7e22ce; cursor: pointer; width: 100%; text-align: center;">
+          ✨ Tạo thêm câu ví dụ bằng AI (Gemini)
+        </button>
       </div>
       ` : ''}
 
@@ -518,6 +524,15 @@
       const jpEl = aiBox.querySelector('.jlex-ai-jp');
       const viEl = aiBox.querySelector('.jlex-ai-vi');
       const errorEl = aiBox.querySelector('.jlex-ai-error');
+      const toggleAiBtn = popup.querySelector('.jlex-btn-toggle-ai');
+
+      if (toggleAiBtn) {
+        toggleAiBtn.onclick = () => {
+          aiBox.style.display = 'block';
+          toggleAiBtn.style.display = 'none';
+          triggerGenerate(false);
+        };
+      }
 
       const triggerGenerate = (force = false) => {
         if (btnGen) btnGen.style.display = 'none';
@@ -577,8 +592,8 @@
       if (btnGen) btnGen.onclick = () => triggerGenerate(false);
       if (btnRegen) btnRegen.onclick = () => triggerGenerate(true);
 
-      // Auto-trigger if enabled in settings
-      if (settings.autoAiExamples) {
+      // Auto-trigger if enabled in settings and dictionary doesn't have examples
+      if (!hasExample && settings.autoAiExamples) {
         triggerGenerate(false);
       }
     }
