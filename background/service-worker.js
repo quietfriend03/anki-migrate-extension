@@ -452,9 +452,16 @@ async function fetchAvailableGeminiModels(apiKey) {
 }
 
 async function callGeminiApi(apiKey, model, requestBody) {
-  let cleanModel = (model || 'gemini-2.0-flash').trim().replace(/^models\//, '');
-  if (!cleanModel || cleanModel.startsWith('gemma-') || cleanModel === 'gemini-2.5-flash' || cleanModel === 'gemini-3.1-pro-preview') {
-    cleanModel = 'gemini-2.0-flash';
+  let cleanModel = (model || 'gemini-3.6-flash').trim().replace(/^models\//, '');
+  if (
+    !cleanModel ||
+    cleanModel.startsWith('gemma-') ||
+    cleanModel === 'gemini-2.0-flash' ||
+    cleanModel === 'gemini-2.0-flash-lite' ||
+    cleanModel === 'gemini-2.5-flash' ||
+    cleanModel === 'gemini-3.1-pro-preview'
+  ) {
+    cleanModel = 'gemini-3.6-flash';
   }
   const versions = ['v1beta', 'v1'];
   let lastError = null;
@@ -484,9 +491,9 @@ async function callGeminiApi(apiKey, model, requestBody) {
     }
   }
 
-  // Fallback to gemini-2.0-flash or gemini-1.5-flash if user model failed
-  if (cleanModel !== 'gemini-2.0-flash') {
-    for (const fallbackModel of ['gemini-2.0-flash', 'gemini-1.5-flash']) {
+  // Fallback to gemini-3.6-flash or gemini-1.5-flash if user model was deprecated or failed
+  if (cleanModel !== 'gemini-3.6-flash') {
+    for (const fallbackModel of ['gemini-3.6-flash', 'gemini-1.5-flash']) {
       for (const ver of versions) {
         const url = `https://generativelanguage.googleapis.com/${ver}/models/${fallbackModel}:generateContent?key=${apiKey}`;
         try {
@@ -719,16 +726,22 @@ const aiExampleCache = new Map();
 async function handleGeminiAnalyzeWord({ word, reading, definition, forceRegenerate = false }) {
   const config = await chrome.storage.local.get({
     geminiApiKey: '',
-    geminiModel: 'gemini-2.0-flash'
+    geminiModel: 'gemini-3.6-flash'
   });
 
   const apiKey = config.geminiApiKey;
   if (!apiKey) return null;
 
-  let model = (config.geminiModel || 'gemini-2.0-flash').trim();
-  if (model.startsWith('gemma-') || model === 'gemini-2.5-flash' || model === 'gemini-3.1-pro-preview') {
-    model = 'gemini-2.0-flash';
-    chrome.storage.local.set({ geminiModel: 'gemini-2.0-flash' }).catch(() => {});
+  let model = (config.geminiModel || 'gemini-3.6-flash').trim();
+  if (
+    model.startsWith('gemma-') ||
+    model === 'gemini-2.0-flash' ||
+    model === 'gemini-2.0-flash-lite' ||
+    model === 'gemini-2.5-flash' ||
+    model === 'gemini-3.1-pro-preview'
+  ) {
+    model = 'gemini-3.6-flash';
+    chrome.storage.local.set({ geminiModel: 'gemini-3.6-flash' }).catch(() => {});
   }
 
   const variationPrompt = forceRegenerate
@@ -2222,12 +2235,29 @@ async function handleTestAnki({ ankiUrl, modelName }) {
 /**
  * Test Gemini API connection
  */
-async function handleTestGemini({ apiKey, model = 'gemini-2.0-flash' }) {
+async function handleTestGemini({ apiKey, model = 'gemini-3.6-flash' }) {
   if (!apiKey) throw new Error('Vui lòng nhập API Key');
 
-  let targetModel = (model || 'gemini-2.0-flash').trim().replace(/^models\//, '');
-  if (targetModel.startsWith('gemma-') || targetModel === 'gemini-2.5-flash' || targetModel === 'gemini-3.1-pro-preview') {
-    targetModel = 'gemini-2.0-flash';
+  // Fetch available models first
+  const availableModels = await fetchAvailableGeminiModels(apiKey);
+  const availableNames = availableModels.map((m) => m.name);
+
+  let targetModel = (model || 'gemini-3.6-flash').trim().replace(/^models\//, '');
+  if (
+    !targetModel ||
+    targetModel.startsWith('gemma-') ||
+    targetModel === 'gemini-2.0-flash' ||
+    targetModel === 'gemini-2.0-flash-lite' ||
+    targetModel === 'gemini-2.5-flash' ||
+    targetModel === 'gemini-3.1-pro-preview'
+  ) {
+    if (availableNames.includes('gemini-3.6-flash')) {
+      targetModel = 'gemini-3.6-flash';
+    } else if (availableNames.length > 0) {
+      targetModel = availableNames[0];
+    } else {
+      targetModel = 'gemini-3.6-flash';
+    }
   }
 
   const testBody = {
@@ -2241,23 +2271,29 @@ async function handleTestGemini({ apiKey, model = 'gemini-2.0-flash' }) {
     responseText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'OK';
   } catch (err) {
     console.warn(`[Gemini Test] Model ${targetModel} failed:`, err.message);
-    if (targetModel !== 'gemini-2.0-flash') {
+    // If targetModel failed or is no longer available, try gemini-3.6-flash or other genuine available Gemini models
+    let fallbackWorked = false;
+    const fallbackCandidates = ['gemini-3.6-flash', ...availableNames].filter(
+      (m, idx, arr) => m && m !== targetModel && arr.indexOf(m) === idx
+    );
+
+    for (const cand of fallbackCandidates) {
       try {
-        console.log(`[Gemini Test] Trying fallback model: gemini-2.0-flash`);
-        const fallbackData = await callGeminiApi(apiKey, 'gemini-2.0-flash', testBody);
+        console.log(`[Gemini Test] Trying fallback candidate: ${cand}`);
+        const fallbackData = await callGeminiApi(apiKey, cand, testBody);
         responseText = fallbackData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'OK';
-        targetModel = 'gemini-2.0-flash';
-      } catch (_) {
-        throw err;
-      }
-    } else {
+        targetModel = cand;
+        fallbackWorked = true;
+        break;
+      } catch (_) {}
+    }
+
+    if (!fallbackWorked) {
       throw err;
     }
   }
 
   await chrome.storage.local.set({ geminiModel: targetModel });
-
-  const availableModels = await fetchAvailableGeminiModels(apiKey);
 
   return {
     response: responseText,

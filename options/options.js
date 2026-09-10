@@ -125,7 +125,7 @@ function showToast(message) {
 async function loadSettings() {
   const config = await chrome.storage.local.get({
     geminiApiKey: '',
-    geminiModel: 'gemini-2.0-flash',
+    geminiModel: 'gemini-3.6-flash',
     geminiPrompt: '',
     ankiUrl: 'http://localhost:8765',
     deckName: 'Japanese_Learning',
@@ -146,15 +146,36 @@ async function loadSettings() {
 
   // Gemini
   geminiApiKeyInput.value = config.geminiApiKey;
-  let modelVal = config.geminiModel || 'gemini-2.0-flash';
-  if (modelVal.startsWith('gemma-') || modelVal === 'gemini-2.5-flash' || modelVal === 'gemini-3.1-pro-preview') {
-    modelVal = 'gemini-2.0-flash';
-    await chrome.storage.local.set({ geminiModel: 'gemini-2.0-flash' });
+  let modelVal = config.geminiModel || 'gemini-3.6-flash';
+  if (
+    modelVal.startsWith('gemma-') ||
+    modelVal === 'gemini-2.0-flash' ||
+    modelVal === 'gemini-2.0-flash-lite' ||
+    modelVal === 'gemini-2.5-flash' ||
+    modelVal === 'gemini-3.1-pro-preview'
+  ) {
+    modelVal = 'gemini-3.6-flash';
+    await chrome.storage.local.set({ geminiModel: 'gemini-3.6-flash' });
   }
   geminiModelSelect.value = modelVal;
   geminiPromptText.value = config.geminiPrompt;
   if (autoAiExamplesCheckbox) {
     autoAiExamplesCheckbox.checked = config.autoAiExamples !== false;
+  }
+
+  // If API key is present, auto-fetch actual available models in background
+  if (config.geminiApiKey) {
+    chrome.runtime.sendMessage(
+      {
+        type: 'LIST_GEMINI_MODELS',
+        payload: { apiKey: config.geminiApiKey }
+      },
+      (res) => {
+        if (res && res.success && res.data && res.data.length > 0) {
+          updateModelSelectOptions(res.data, modelVal);
+        }
+      }
+    );
   }
 
   // Anki
