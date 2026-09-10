@@ -20,19 +20,22 @@
   let settings = {
     triggerKey: 'Shift', // 'Shift', 'Alt', or 'none' (selection only)
     enableScan: true,
-    maxScanLength: 16
+    maxScanLength: 16,
+    autoAiExamples: true
   };
 
-  chrome.storage.local.get(['triggerKey', 'enableScan', 'maxScanLength'], (items) => {
+  chrome.storage.local.get(['triggerKey', 'enableScan', 'maxScanLength', 'autoAiExamples'], (items) => {
     if (items.triggerKey !== undefined) settings.triggerKey = items.triggerKey;
     if (items.enableScan !== undefined) settings.enableScan = items.enableScan;
     if (items.maxScanLength !== undefined) settings.maxScanLength = items.maxScanLength;
+    if (items.autoAiExamples !== undefined) settings.autoAiExamples = items.autoAiExamples;
   });
 
   chrome.storage.onChanged.addListener((changes) => {
     if (changes.triggerKey) settings.triggerKey = changes.triggerKey.newValue;
     if (changes.enableScan) settings.enableScan = changes.enableScan.newValue;
     if (changes.maxScanLength) settings.maxScanLength = changes.maxScanLength.newValue;
+    if (changes.autoAiExamples !== undefined) settings.autoAiExamples = changes.autoAiExamples.newValue;
   });
 
   /**
@@ -432,6 +435,7 @@
     };
 
     const viPos = match?.viPos || '';
+    const hasExample = Boolean(match?.hasExample || (defsListHtml && (defsListHtml.includes('jlex-sc-example') || defsListHtml.includes('Tatoeba'))));
 
     popup.innerHTML = `
       <div class="jlex-header">
@@ -471,6 +475,28 @@
         ${defsListHtml}
       </ol>
 
+      ${!hasExample ? `
+      <div class="jlex-ai-example-box" style="margin: 10px 0; padding: 10px 12px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px;">
+        <div class="jlex-ai-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <span style="font-size: 11px; font-weight: 700; color: #7e22ce; text-transform: uppercase; letter-spacing: 0.5px;">✨ Ví dụ AI (Gemini)</span>
+          <button type="button" class="jlex-btn-regen-ai" style="display: none; background: none; border: none; font-size: 11px; font-weight: 600; color: #9333ea; cursor: pointer; text-decoration: underline;">🔄 Đổi câu khác</button>
+        </div>
+        <div class="jlex-ai-content">
+          <button type="button" class="jlex-btn-generate-ai" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 12px; background: #ffffff; color: #7e22ce; border: 1px dashed #c084fc; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s ease;">
+            <span>✨ Tạo ví dụ bằng AI</span>
+          </button>
+          <div class="jlex-ai-loading" style="display: none; font-size: 12px; color: #7e22ce; text-align: center; padding: 4px;">
+            ⏳ Đang dùng Gemini AI tạo ví dụ...
+          </div>
+          <div class="jlex-ai-result" style="display: none;">
+            <div class="jlex-ai-jp" style="font-size: 14.5px; font-weight: 600; line-height: 1.9; color: #1e293b;"></div>
+            <div class="jlex-ai-vi" style="font-size: 12.5px; color: #64748b; font-style: italic; margin-top: 4px; line-height: 1.4;"></div>
+          </div>
+          <div class="jlex-ai-error" style="display: none; font-size: 11.5px; color: #dc2626; margin-top: 4px; line-height: 1.4;"></div>
+        </div>
+      </div>
+      ` : ''}
+
       <div class="jlex-anki-section">
         <button class="jlex-btn-anki">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -481,6 +507,81 @@
       </div>
       <div class="jlex-status-msg"></div>
     `;
+
+    // AI Example Handler
+    const aiBox = popup.querySelector('.jlex-ai-example-box');
+    if (aiBox) {
+      const btnGen = aiBox.querySelector('.jlex-btn-generate-ai');
+      const btnRegen = aiBox.querySelector('.jlex-btn-regen-ai');
+      const loadingEl = aiBox.querySelector('.jlex-ai-loading');
+      const resultEl = aiBox.querySelector('.jlex-ai-result');
+      const jpEl = aiBox.querySelector('.jlex-ai-jp');
+      const viEl = aiBox.querySelector('.jlex-ai-vi');
+      const errorEl = aiBox.querySelector('.jlex-ai-error');
+
+      const triggerGenerate = (force = false) => {
+        if (btnGen) btnGen.style.display = 'none';
+        if (resultEl) resultEl.style.display = 'none';
+        if (errorEl) errorEl.style.display = 'none';
+        if (btnRegen) btnRegen.style.display = 'none';
+        if (loadingEl) loadingEl.style.display = 'block';
+
+        chrome.runtime.sendMessage(
+          {
+            type: 'GENERATE_AI_EXAMPLE',
+            payload: {
+              word: activeWordData.word,
+              reading: activeWordData.reading,
+              definition: activeWordData.definitionPlain,
+              forceRegenerate: force
+            }
+          },
+          (res) => {
+            if (loadingEl) loadingEl.style.display = 'none';
+            if (res && res.success && res.data) {
+              const { ex_furigana, ex_vi } = res.data;
+              activeWordData.aiExample = {
+                jp: ex_furigana,
+                vi: ex_vi
+              };
+              if (jpEl) jpEl.innerHTML = ex_furigana;
+              if (viEl) viEl.textContent = ex_vi;
+              if (resultEl) resultEl.style.display = 'block';
+              if (btnRegen) btnRegen.style.display = 'inline-block';
+            } else {
+              const errMsg = res?.error || 'Không thể tạo ví dụ AI.';
+              if (errMsg.includes('NO_API_KEY')) {
+                if (errorEl) {
+                  errorEl.innerHTML = `💡 Chưa có Gemini API Key. <a href="#" class="jlex-link-options" style="color:#2563eb; text-decoration:underline; font-weight:600;">Nhập key miễn phí ↗</a>`;
+                  const link = errorEl.querySelector('.jlex-link-options');
+                  if (link) {
+                    link.onclick = (e) => {
+                      e.preventDefault();
+                      chrome.runtime.sendMessage({ type: 'OPEN_OPTIONS' });
+                    };
+                  }
+                  errorEl.style.display = 'block';
+                }
+              } else {
+                if (errorEl) {
+                  errorEl.textContent = `Lỗi: ${errMsg}`;
+                  errorEl.style.display = 'block';
+                }
+                if (btnGen) btnGen.style.display = 'flex';
+              }
+            }
+          }
+        );
+      };
+
+      if (btnGen) btnGen.onclick = () => triggerGenerate(false);
+      if (btnRegen) btnRegen.onclick = () => triggerGenerate(true);
+
+      // Auto-trigger if enabled in settings
+      if (settings.autoAiExamples) {
+        triggerGenerate(false);
+      }
+    }
 
     // Bind event listeners
     popup.querySelector('.jlex-btn-close').onclick = removePopup;
@@ -584,7 +685,8 @@
             reading: activeWordData.reading,
             hanviet: activeWordData.hanviet,
             definition: activeWordData.definition,
-            example: '',
+            example: activeWordData.aiExample ? activeWordData.aiExample.jp : '',
+            aiExample: activeWordData.aiExample,
             audioUrl: activeWordData.audioUrl
           }
         },

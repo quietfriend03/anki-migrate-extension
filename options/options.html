@@ -154,6 +154,16 @@
           <span class="help-text">Biến hỗ trợ: <code>{word}</code>, <code>{reading}</code>, <code>{definition}</code>.</span>
         </div>
 
+        <div class="form-group" style="margin-top: 14px; padding: 12px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 0;">
+            <input type="checkbox" id="auto-ai-examples" style="width: 18px; height: 18px; cursor: pointer;">
+            <span style="font-weight: 600; color: #6b21a8; font-size: 13.5px;">Tự động tạo ví dụ bằng AI khi từ điển không có sẵn ví dụ</span>
+          </label>
+          <span class="help-text" style="margin-top: 6px; display: block; color: #7e22ce;">
+            Khi bật, mỗi khi bạn tra cứu từ vựng mà từ điển Jitendex chưa có ví dụ, Gemini AI sẽ tự động sinh ngay câu ví dụ có Furigana và dịch nghĩa tiếng Việt.
+          </span>
+        </div>
+
         <div class="action-buttons-row">
           <button id="btn-save-gemini" class="btn btn-primary">Lưu Cấu Hình Gemini</button>
           <button id="btn-test-gemini" class="btn btn-secondary">Kiểm Tra Kết Nối AI</button>

@@ -35,6 +35,7 @@ const btnToggleKey = document.getElementById('btn-toggle-key');
 const geminiModelSelect = document.getElementById('gemini-model');
 const btnFetchModels = document.getElementById('btn-fetch-models');
 const geminiPromptText = document.getElementById('gemini-prompt');
+const autoAiExamplesCheckbox = document.getElementById('auto-ai-examples');
 const btnSaveGemini = document.getElementById('btn-save-gemini');
 const btnTestGemini = document.getElementById('btn-test-gemini');
 const geminiTestResult = document.getElementById('gemini-test-result');
@@ -139,13 +140,17 @@ async function loadSettings() {
     },
     triggerKey: 'Shift',
     enableScan: true,
-    maxScanLength: 16
+    maxScanLength: 16,
+    autoAiExamples: true
   });
 
   // Gemini
   geminiApiKeyInput.value = config.geminiApiKey;
   geminiModelSelect.value = config.geminiModel;
   geminiPromptText.value = config.geminiPrompt;
+  if (autoAiExamplesCheckbox) {
+    autoAiExamplesCheckbox.checked = config.autoAiExamples !== false;
+  }
 
   // Anki
   ankiUrlInput.value = config.ankiUrl;
@@ -213,7 +218,8 @@ btnSaveGemini.addEventListener('click', async () => {
   await chrome.storage.local.set({
     geminiApiKey: geminiApiKeyInput.value.trim(),
     geminiModel: geminiModelSelect.value,
-    geminiPrompt: geminiPromptText.value.trim()
+    geminiPrompt: geminiPromptText.value.trim(),
+    autoAiExamples: autoAiExamplesCheckbox ? autoAiExamplesCheckbox.checked : true
   });
   showToast('Đã lưu cấu hình Gemini AI!');
 });

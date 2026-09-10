@@ -52,9 +52,11 @@
   - Tự động kiểm tra xem từ vựng đã tồn tại trong Deck được chọn chưa.
   - Nếu từ vựng đã có trong Anki, nút chuyển sang trạng thái **"Đã có trong Anki"** và khóa lại, ngăn ngừa việc thêm thẻ trùng lặp gây rác bộ thẻ.
 
-- 🤖 **Trí tuệ nhân tạo Gemini AI (Tối ưu hóa tạo thẻ):**
-  - Chỉ kích hoạt khi người dùng nhấn lưu thẻ vào Anki.
-  - Gemini AI phân tích ngữ cảnh, bổ sung Furigana dạng `<ruby>` chuẩn cho toàn bộ câu ví dụ và dịch nghĩa câu ví dụ sang tiếng Việt tự nhiên, chính xác.
+- 🤖 **Trí tuệ nhân tạo Gemini AI (Sinh ví dụ ngữ cảnh & Tối ưu hóa tạo thẻ):**
+  - **Tự động tạo câu ví dụ khi từ điển thiếu:** Đối với các từ vựng trong Jitendex không có sẵn câu ví dụ, tiện ích hiển thị nút **✨ Tạo ví dụ bằng AI** (hoặc tự động sinh nếu bật tùy chọn). Gemini AI sẽ tạo 01 câu ví dụ tiếng Nhật tự nhiên chuẩn ngữ cảnh kèm Furigana (`<ruby>`) và bản dịch tiếng Việt sát nghĩa.
+  - **Nút 🔄 Đổi câu khác:** Cho phép người dùng đổi ngay sang một câu ví dụ khác với ngữ cảnh phong phú, sinh động hơn.
+  - **Bộ nhớ đệm (Cache thông minh):** Tự động lưu các câu ví dụ AI đã tạo vào bộ nhớ đệm, giúp tra lại tức thì mà không tiêu tốn lượt gọi API.
+  - **Đồng bộ hoàn hảo vào Anki:** Khi lưu thẻ vào Anki, câu ví dụ AI vừa tạo (hoặc tự sinh mới) sẽ được đóng gói chuẩn vào phần Meaning của thẻ Linguist.
 
 - 🔊 **Phát âm từ vựng chuẩn giọng bản xứ:**
   - Tích hợp nghe phát âm tức thì qua giọng đọc tiếng Nhật chuẩn (Youdao CDN + Web Speech API fallback).

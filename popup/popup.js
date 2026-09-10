@@ -143,6 +143,7 @@ function renderResults(data) {
       .join('<br>');
 
     const viPos = item.viPos || '';
+    const hasExample = Boolean(item.hasExample || (defsHtml && (defsHtml.includes('jlex-sc-example') || defsHtml.includes('Tatoeba'))));
 
     card.innerHTML = `
       <div class="result-header">
@@ -173,6 +174,28 @@ function renderResults(data) {
         <div class="strokes-panel" style="display: none; margin-top: 8px; max-height: 220px; overflow-y: auto;">
           <div class="strokes-loading" style="font-size: 12px; color: #64748b;">Đang tải nét viết...</div>
           <div class="strokes-content"></div>
+        </div>
+      </div>
+      ` : ''}
+
+      ${!hasExample ? `
+      <div class="ai-example-box" style="margin: 8px 0 10px; padding: 10px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <span style="font-size: 11px; font-weight: 700; color: #7e22ce; text-transform: uppercase;">✨ Ví dụ AI (Gemini)</span>
+          <button type="button" class="btn-regen-ai" style="display: none; background: none; border: none; font-size: 11px; font-weight: 600; color: #9333ea; cursor: pointer; text-decoration: underline;">🔄 Đổi câu khác</button>
+        </div>
+        <div class="ai-content-wrap">
+          <button type="button" class="btn-generate-ai" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 10px; background: #ffffff; color: #7e22ce; border: 1px dashed #c084fc; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;">
+            <span>✨ Tạo ví dụ bằng AI</span>
+          </button>
+          <div class="ai-loading" style="display: none; font-size: 12px; color: #7e22ce; text-align: center; padding: 4px;">
+            ⏳ Đang dùng Gemini AI tạo ví dụ...
+          </div>
+          <div class="ai-result" style="display: none;">
+            <div class="ai-jp" style="font-size: 14px; font-weight: 600; line-height: 1.8; color: #1e293b;"></div>
+            <div class="ai-vi" style="font-size: 12px; color: #64748b; font-style: italic; margin-top: 4px; line-height: 1.4;"></div>
+          </div>
+          <div class="ai-error" style="display: none; font-size: 11px; color: #dc2626; margin-top: 4px;"></div>
         </div>
       </div>
       ` : ''}
@@ -253,6 +276,76 @@ function renderResults(data) {
       };
     }
 
+    // AI Example Handler
+    const aiBox = card.querySelector('.ai-example-box');
+    if (aiBox) {
+      const btnGen = aiBox.querySelector('.btn-generate-ai');
+      const btnRegen = aiBox.querySelector('.btn-regen-ai');
+      const loadingEl = aiBox.querySelector('.ai-loading');
+      const resultEl = aiBox.querySelector('.ai-result');
+      const jpEl = aiBox.querySelector('.ai-jp');
+      const viEl = aiBox.querySelector('.ai-vi');
+      const errorEl = aiBox.querySelector('.ai-error');
+
+      const triggerGenerate = (force = false) => {
+        if (btnGen) btnGen.style.display = 'none';
+        if (resultEl) resultEl.style.display = 'none';
+        if (errorEl) errorEl.style.display = 'none';
+        if (btnRegen) btnRegen.style.display = 'none';
+        if (loadingEl) loadingEl.style.display = 'block';
+
+        chrome.runtime.sendMessage(
+          {
+            type: 'GENERATE_AI_EXAMPLE',
+            payload: {
+              word: item.term,
+              reading: item.reading,
+              definition: defsPlain,
+              forceRegenerate: force
+            }
+          },
+          (res) => {
+            if (loadingEl) loadingEl.style.display = 'none';
+            if (res && res.success && res.data) {
+              const { ex_furigana, ex_vi } = res.data;
+              item.aiExample = {
+                jp: ex_furigana,
+                vi: ex_vi
+              };
+              if (jpEl) jpEl.innerHTML = ex_furigana;
+              if (viEl) viEl.textContent = ex_vi;
+              if (resultEl) resultEl.style.display = 'block';
+              if (btnRegen) btnRegen.style.display = 'inline-block';
+            } else {
+              const errMsg = res?.error || 'Không thể tạo ví dụ AI.';
+              if (errMsg.includes('NO_API_KEY')) {
+                if (errorEl) {
+                  errorEl.innerHTML = `💡 Chưa có Gemini API Key. <a href="#" class="link-open-options" style="color:#2563eb; text-decoration:underline; font-weight:600;">Nhập key miễn phí ↗</a>`;
+                  const link = errorEl.querySelector('.link-open-options');
+                  if (link) {
+                    link.onclick = (e) => {
+                      e.preventDefault();
+                      chrome.runtime.openOptionsPage();
+                    };
+                  }
+                  errorEl.style.display = 'block';
+                }
+              } else {
+                if (errorEl) {
+                  errorEl.textContent = `Lỗi: ${errMsg}`;
+                  errorEl.style.display = 'block';
+                }
+                if (btnGen) btnGen.style.display = 'flex';
+              }
+            }
+          }
+        );
+      };
+
+      if (btnGen) btnGen.onclick = () => triggerGenerate(false);
+      if (btnRegen) btnRegen.onclick = () => triggerGenerate(true);
+    }
+
     // Anki Click
     const btnAddAnki = card.querySelector('.btn-add-anki');
 
@@ -285,7 +378,8 @@ function renderResults(data) {
             reading: item.reading,
             hanviet: hanviet,
             definition: defsHtmlForAnki || defsPlain,
-            example: '',
+            example: item.aiExample ? item.aiExample.jp : '',
+            aiExample: item.aiExample,
             audioUrl: `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.term)}&le=jap`
           }
         },

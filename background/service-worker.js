@@ -251,6 +251,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'CLEAR_DATABASE':
         return await handleClearDatabase();
 
+      case 'OPEN_OPTIONS':
+        await chrome.runtime.openOptionsPage();
+        return { success: true };
+
       default:
         throw new Error(`Unknown message type: ${type}`);
     }
@@ -264,6 +268,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Keep channel open for async response
   return true;
 });
+
+/**
+ * Helper to detect whether a list of definitions contains example sentences
+ */
+function hasExampleSentence(definitions) {
+  if (!definitions || !Array.isArray(definitions) || definitions.length === 0) return false;
+
+  function checkNode(node) {
+    if (!node) return false;
+    if (typeof node === 'string') {
+      if (node.includes('jlex-sc-example') || node.includes('Tatoeba') || /<ruby>.*<\/ruby>.*[。？！]/s.test(node)) {
+        return true;
+      }
+      return false;
+    }
+    if (Array.isArray(node)) {
+      return node.some(checkNode);
+    }
+    if (typeof node === 'object') {
+      if (node.data && typeof node.data === 'object') {
+        const content = String(node.data.content || '');
+        if (/example/i.test(content)) return true;
+      }
+      if (node.content !== undefined) {
+        return checkNode(node.content);
+      }
+    }
+    return false;
+  }
+
+  return definitions.some(checkNode);
+}
 
 /**
  * Handle term scan lookup at cursor position
@@ -283,13 +319,15 @@ async function handleLookup({ text, maxScanLength = 16 }) {
           : [];
 
         const enPos = formatPosToEnglish(item.definitionTags || item.rules || []);
+        const hasExample = hasExampleSentence(enrichedDefs);
 
         return {
           ...item,
           hanviet,
           enPos,
           viPos: enPos, // Backward compatible property
-          definitions: enrichedDefs
+          definitions: enrichedDefs,
+          hasExample
         };
       })
     );
@@ -316,7 +354,8 @@ async function handleLookup({ text, maxScanLength = 16 }) {
         definitions: [onlineVi],
         hanviet: directHanviet,
         enPos: '',
-        viPos: ''
+        viPos: '',
+        hasExample: false
       };
     }
   } catch (e) {
@@ -345,12 +384,14 @@ async function handleLookupExact({ text }) {
         ? await Promise.all(item.definitions.map((d) => translateExampleSentencesInNode(d)))
         : [];
       const enPos = formatPosToEnglish(item.definitionTags || item.rules || []);
+      const hasExample = hasExampleSentence(enrichedDefs);
       return {
         ...item,
         hanviet,
         enPos,
         viPos: enPos,
-        definitions: enrichedDefs
+        definitions: enrichedDefs,
+        hasExample
       };
     })
   );
@@ -644,13 +685,18 @@ async function handleGetKanjiStrokes({ word }) {
 }
 
 /**
- * Call Gemini AI to analyze a word for Anki export:
+ * In-memory cache for AI-generated examples to prevent redundant API calls
+ */
+const aiExampleCache = new Map();
+
+/**
+ * Call Gemini AI to analyze a word for Anki export / AI example generation:
  * - English definitions & POS (matching Jitendex standards)
  * - Natural Japanese example with Furigana (<ruby> tags)
  * - Accurate Vietnamese translation of the example sentence
  * - Kanji breakdown details (On, Kun, Hán-Việt, meaning)
  */
-async function handleGeminiAnalyzeWord({ word, reading, definition }) {
+async function handleGeminiAnalyzeWord({ word, reading, definition, forceRegenerate = false }) {
   const config = await chrome.storage.local.get({
     geminiApiKey: '',
     geminiModel: 'gemini-2.5-flash'
@@ -661,10 +707,14 @@ async function handleGeminiAnalyzeWord({ word, reading, definition }) {
 
   const model = config.geminiModel || 'gemini-2.5-flash';
 
+  const variationPrompt = forceRegenerate
+    ? '\n(LƯU Ý: Vui lòng tạo một câu ví dụ mới, sinh động, tự nhiên và khác biệt với các câu ví dụ thông thường).'
+    : '';
+
   const promptText = `Bạn là một từ điển Nhật - Anh - Việt chuyên sâu và chuẩn xác.
 Hãy phân tích từ vựng tiếng Nhật sau:
 Từ: "${word}", Cách đọc: "${reading || ''}".
-Nghĩa gốc tham khảo: "${definition || ''}".
+Nghĩa gốc tham khảo: "${definition || ''}".${variationPrompt}
 
 Yêu cầu nghiêm ngặt:
 1. Định nghĩa và giải nghĩa bằng TIẾNG ANH súc tích, chuẩn từ điển Jitendex/JMdict (ví dụ: "establishment; creation", "setting; configuration").
@@ -708,7 +758,7 @@ BẮT BUỘC trả về kết quả dưới dạng JSON thuần túy (không kè
       ]
     },
     generationConfig: {
-      temperature: 0.2,
+      temperature: forceRegenerate ? 0.7 : 0.2,
       responseMimeType: "application/json",
       thinkingConfig: {
         thinkingBudget: 0
@@ -769,24 +819,55 @@ BẮT BUỘC trả về kết quả dưới dạng JSON thuần túy (không kè
     }
   } catch (err) {
     console.warn('[Gemini] Word analysis failed:', err);
+    throw err;
   }
 
   return null;
 }
 
 /**
- * Backwards-compatible handleGeminiGenerate
+ * Handle Gemini AI Example generation with caching and regeneration support
  */
-async function handleGeminiGenerate({ word, reading, definition }) {
-  const analysis = await handleGeminiAnalyzeWord({ word, reading, definition });
-  if (analysis) {
-    return {
-      ex_jp: analysis.ex_ruby ? analysis.ex_ruby.replace(/<rt>[^<]*<\/rt>/g, '').replace(/<\/?ruby>/g, '') : '',
-      ex_furigana: analysis.ex_ruby || '',
+async function handleGeminiGenerate({ word, reading, definition, forceRegenerate = false }) {
+  const config = await chrome.storage.local.get({
+    geminiApiKey: ''
+  });
+
+  const apiKey = config.geminiApiKey;
+  if (!apiKey) {
+    throw new Error('NO_API_KEY');
+  }
+
+  const cleanWord = (word || '').trim();
+  if (!cleanWord) {
+    throw new Error('Từ vựng không hợp lệ.');
+  }
+
+  if (!forceRegenerate && aiExampleCache.has(cleanWord)) {
+    return aiExampleCache.get(cleanWord);
+  }
+
+  const analysis = await handleGeminiAnalyzeWord({
+    word: cleanWord,
+    reading,
+    definition,
+    forceRegenerate
+  });
+
+  if (analysis && (analysis.ex_ruby || analysis.ex_jp)) {
+    const rawRuby = analysis.ex_ruby || analysis.ex_jp;
+    const formattedRuby = ensureRubyFurigana(rawRuby);
+    const plainJp = formattedRuby.replace(/<rt>[^<]*<\/rt>/g, '').replace(/<\/?ruby>/g, '');
+    const result = {
+      ex_jp: plainJp,
+      ex_furigana: formattedRuby,
       ex_vi: analysis.ex_vi || ''
     };
+    aiExampleCache.set(cleanWord, result);
+    return result;
   }
-  return { ex_jp: '', ex_furigana: '', ex_vi: '' };
+
+  throw new Error('AI không thể tạo được câu ví dụ cho từ này. Vui lòng thử lại.');
 }
 
 function escapeHtml(str) {
@@ -1090,7 +1171,7 @@ async function handleCheckNoteExists({ word, deckName }) {
  * - Contextual example in a sleek callout card with ruby furigana and Vietnamese translation beneath
  * - Cleans any raw JMdict / Tatoeba or unformatted text
  */
-async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, reading }) {
+async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, reading, providedExample }) {
   let text = (rawDefinition || '').trim();
 
   // Strip attribution & citations
@@ -1236,8 +1317,22 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
   if (posList.length === 0 && (aiData?.pos_en || aiData?.pos_vi)) {
     (aiData.pos_en || aiData.pos_vi).split(/[•,]/).forEach((p) => addPos(p.trim()));
   }
-  if (examples.length === 0 && aiData?.ex_ruby) {
-    examples.push({ jp: aiData.ex_ruby, vi: aiData.ex_vi || '' });
+
+  // Prioritize provided example from client, then aiData, then cache
+  if (examples.length === 0) {
+    if (providedExample && (providedExample.jp || providedExample.ex_ruby || providedExample.ex_furigana)) {
+      examples.push({
+        jp: ensureRubyFurigana(providedExample.jp || providedExample.ex_ruby || providedExample.ex_furigana),
+        vi: providedExample.vi || providedExample.ex_vi || ''
+      });
+    } else if (aiData?.ex_ruby) {
+      examples.push({ jp: ensureRubyFurigana(aiData.ex_ruby), vi: aiData.ex_vi || '' });
+    } else if (word && aiExampleCache.has(word)) {
+      const cached = aiExampleCache.get(word);
+      if (cached?.ex_furigana) {
+        examples.push({ jp: ensureRubyFurigana(cached.ex_furigana), vi: cached.ex_vi || '' });
+      }
+    }
   }
 
   // Build HTML Badges
@@ -1292,7 +1387,7 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
 /**
  * Handle AnkiConnect export with Linguist Japanese Vocab Template, Native Audio Download & Stroke Order
  */
-async function handleAddToAnki({ word, reading, hanviet, definition, example, audioUrl }) {
+async function handleAddToAnki({ word, reading, hanviet, definition, example, aiExample, audioUrl }) {
   const config = await chrome.storage.local.get({
     ankiUrl: 'http://localhost:8765',
     deckName: 'Japanese_Learning',
@@ -1323,7 +1418,9 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, au
     throw new Error(`Từ "${cleanWord}" đã tồn tại trong deck "${deckName}" của Anki.`);
   }
 
-  // 1. Analyze word via Gemini AI (definitions, Furigana example, Kanji breakdown)
+  const providedExample = aiExample || (example && typeof example === 'object' ? example : null);
+
+  // 1. Analyze word via Gemini AI if no example provided and key is present
   let aiData = null;
   try {
     aiData = await handleGeminiAnalyzeWord({
@@ -1340,7 +1437,8 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, au
     aiData,
     rawDefinition: cleanDefinition,
     word: cleanWord,
-    reading: cleanReading
+    reading: cleanReading,
+    providedExample
   });
 
   // 3. Build Kanji Stroke Order Cards with Self-Writing Animations matching Image 2
