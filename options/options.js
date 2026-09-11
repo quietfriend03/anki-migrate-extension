@@ -125,7 +125,7 @@ function showToast(message) {
 async function loadSettings() {
   const config = await chrome.storage.local.get({
     geminiApiKey: '',
-    geminiModel: 'gemini-3.6-flash',
+    geminiModel: 'gemini-2.5-flash',
     geminiPrompt: '',
     ankiUrl: 'http://localhost:8765',
     deckName: 'Japanese_Learning',
@@ -146,16 +146,19 @@ async function loadSettings() {
 
   // Gemini
   geminiApiKeyInput.value = config.geminiApiKey;
-  let modelVal = config.geminiModel || 'gemini-3.6-flash';
-  if (
-    modelVal.startsWith('gemma-') ||
-    modelVal === 'gemini-2.0-flash' ||
-    modelVal === 'gemini-2.0-flash-lite' ||
-    modelVal === 'gemini-2.5-flash' ||
-    modelVal === 'gemini-3.1-pro-preview'
-  ) {
-    modelVal = 'gemini-3.6-flash';
-    await chrome.storage.local.set({ geminiModel: 'gemini-3.6-flash' });
+  let modelVal = (config.geminiModel || 'gemini-2.5-flash').trim();
+  if (modelVal.startsWith('gemma-')) {
+    modelVal = 'gemini-2.5-flash';
+    await chrome.storage.local.set({ geminiModel: 'gemini-2.5-flash' });
+  }
+
+  // Ensure modelVal exists as an option in geminiModelSelect
+  const optionExists = Array.from(geminiModelSelect.options).some((o) => o.value === modelVal);
+  if (!optionExists && modelVal) {
+    const opt = document.createElement('option');
+    opt.value = modelVal;
+    opt.textContent = `${modelVal} (Đang lưu)`;
+    geminiModelSelect.prepend(opt);
   }
   geminiModelSelect.value = modelVal;
   geminiPromptText.value = config.geminiPrompt;
@@ -264,17 +267,25 @@ function updateModelSelectOptions(availableModels, selectedModel = null) {
   const currentVal = selectedModel || geminiModelSelect.value;
   geminiModelSelect.innerHTML = '';
 
+  let matched = false;
   filteredModels.forEach((m) => {
     const opt = document.createElement('option');
     opt.value = m.name;
     opt.textContent = `${m.name} (${m.displayName || 'Khả dụng'})`;
-    if (m.name === currentVal) opt.selected = true;
+    if (m.name === currentVal) {
+      opt.selected = true;
+      matched = true;
+    }
     geminiModelSelect.appendChild(opt);
   });
 
-  // If previous value wasn't in list, select first
-  if (!geminiModelSelect.value && filteredModels.length > 0) {
-    geminiModelSelect.value = filteredModels[0].name;
+  // If user had selected a model not in the list, preserve it as an option so user's choice is not lost
+  if (!matched && currentVal) {
+    const customOpt = document.createElement('option');
+    customOpt.value = currentVal;
+    customOpt.textContent = `${currentVal} (Tùy chọn hiện tại)`;
+    customOpt.selected = true;
+    geminiModelSelect.prepend(customOpt);
   }
 }
 
@@ -321,8 +332,7 @@ btnFetchModels.addEventListener('click', () => {
 
       if (res && res.success && res.data && res.data.length > 0) {
         updateModelSelectOptions(res.data);
-        await chrome.storage.local.set({ geminiModel: geminiModelSelect.value });
-        showResult(geminiTestResult, true, `✓ Đã tìm thấy ${res.data.length} model khả dụng cho API Key của bạn. Đã chọn: "${geminiModelSelect.value}".`);
+        showResult(geminiTestResult, true, `✓ Đã tìm thấy ${res.data.length} model khả dụng cho API Key của bạn. Đang chọn: "${geminiModelSelect.value}". Nhấn "Lưu Cấu Hình Gemini" để lưu lựa chọn.`);
       } else {
         showResult(geminiTestResult, false, `✕ Không thể lấy danh sách model: ${res?.error || 'Kiểm tra lại API Key'}`);
       }
@@ -340,6 +350,7 @@ btnTestGemini.addEventListener('click', () => {
     return;
   }
 
+  const selectedModel = geminiModelSelect.value;
   btnTestGemini.disabled = true;
   btnTestGemini.textContent = 'Đang kiểm tra...';
   geminiTestResult.style.display = 'none';
@@ -357,7 +368,7 @@ btnTestGemini.addEventListener('click', () => {
   chrome.runtime.sendMessage(
     {
       type: 'TEST_GEMINI_CONNECTION',
-      payload: { apiKey, model: geminiModelSelect.value }
+      payload: { apiKey, model: selectedModel }
     },
     async (res) => {
       if (isHandled) return;
@@ -377,11 +388,9 @@ btnTestGemini.addEventListener('click', () => {
         if (availableModels && availableModels.length > 0) {
           updateModelSelectOptions(availableModels, usedModel);
         }
-        geminiModelSelect.value = usedModel;
-        await chrome.storage.local.set({ geminiModel: usedModel });
         showResult(geminiTestResult, true, `✓ Kết nối Gemini thành công với model "${usedModel}"! AI phản hồi: "${response}"`);
       } else {
-        showResult(geminiTestResult, false, `✕ Kết nối thất bại: ${res?.error || 'Lỗi không xác định'}`);
+        showResult(geminiTestResult, false, `✕ Kết nối thất bại với model "${selectedModel}": ${res?.error || 'Lỗi không xác định'}. Bạn có thể chọn model khác và thử lại.`);
       }
     }
   );
