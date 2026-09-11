@@ -2547,3 +2547,25 @@ async function handleClearDatabase() {
   await dictDB.clearDatabase();
   return await dictDB.getStats();
 }
+
+/**
+ * Automatically broadcast scan setting changes to all browser tabs
+ */
+chrome.storage.onChanged.addListener(async (changes, areaName) => {
+  if (areaName === 'local' && changes.enableScan !== undefined) {
+    const isEnabled = changes.enableScan.newValue === true || changes.enableScan.newValue === 'true';
+    try {
+      const tabs = await chrome.tabs.query({});
+      for (const tab of tabs) {
+        if (tab.id) {
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'SET_SCAN_ENABLED',
+            enableScan: isEnabled
+          }).catch(() => {});
+        }
+      }
+    } catch (e) {
+      // Ignore tabs where content script is not loaded
+    }
+  }
+});

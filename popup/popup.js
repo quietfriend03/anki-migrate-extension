@@ -32,11 +32,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Load toggle state
   const config = await chrome.storage.local.get({ enableScan: true, ankiUrl: 'http://localhost:8765', autoAiExamples: true });
-  toggleHoverScan.checked = config.enableScan;
+  toggleHoverScan.checked = config.enableScan === true || config.enableScan === 'true';
   autoAiExamples = config.autoAiExamples !== false;
 
   toggleHoverScan.addEventListener('change', async () => {
-    await chrome.storage.local.set({ enableScan: toggleHoverScan.checked });
+    const isEnabled = toggleHoverScan.checked;
+    await chrome.storage.local.set({ enableScan: isEnabled });
+
+    // Broadcast immediately to all open tabs so current pages update in real-time
+    try {
+      const tabs = await chrome.tabs.query({});
+      for (const tab of tabs) {
+        if (tab.id) {
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'SET_SCAN_ENABLED',
+            enableScan: isEnabled
+          }).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.warn('[Popup] Broadcast error:', e);
+    }
   });
 
   // Check Dictionary status

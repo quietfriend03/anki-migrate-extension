@@ -578,11 +578,31 @@ btnTestAnki.addEventListener('click', () => {
  * Save General Settings
  */
 btnSaveGeneral.addEventListener('click', async () => {
+  const isEnabled = enableScanCheckbox.checked;
+  const triggerKey = triggerKeySelect.value;
+  const maxScanLength = parseInt(maxScanLengthInput.value, 10) || 16;
+
   await chrome.storage.local.set({
-    triggerKey: triggerKeySelect.value,
-    enableScan: enableScanCheckbox.checked,
-    maxScanLength: parseInt(maxScanLengthInput.value, 10) || 16
+    triggerKey,
+    enableScan: isEnabled,
+    maxScanLength
   });
+
+  // Broadcast to all open tabs
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (tab.id) {
+        chrome.tabs.sendMessage(tab.id, {
+          type: 'SETTINGS_UPDATED',
+          payload: { enableScan: isEnabled, triggerKey, maxScanLength }
+        }).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.warn('[Options] Broadcast error:', e);
+  }
+
   showToast('Đã lưu cài đặt phím tắt!');
 });
 

@@ -144,12 +144,14 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 6px 0;
+  padding: 8px 0;
   font-size: 12px;
   color: #4b5563;
   border-top: 1px solid #f1f5f9;
   border-bottom: 1px solid #f1f5f9;
   margin-bottom: 12px;
+  cursor: pointer;
+  user-select: none;
 }
 
 /* Switch */
@@ -158,6 +160,7 @@ body {
   display: inline-block;
   width: 34px;
   height: 18px;
+  pointer-events: none;
 }
 
 .switch input {

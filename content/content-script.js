@@ -26,16 +26,52 @@
 
   chrome.storage.local.get(['triggerKey', 'enableScan', 'maxScanLength', 'autoAiExamples'], (items) => {
     if (items.triggerKey !== undefined) settings.triggerKey = items.triggerKey;
-    if (items.enableScan !== undefined) settings.enableScan = items.enableScan;
+    if (items.enableScan !== undefined) {
+      settings.enableScan = items.enableScan === true || items.enableScan === 'true';
+    }
     if (items.maxScanLength !== undefined) settings.maxScanLength = items.maxScanLength;
     if (items.autoAiExamples !== undefined) settings.autoAiExamples = items.autoAiExamples;
   });
 
-  chrome.storage.onChanged.addListener((changes) => {
-    if (changes.triggerKey) settings.triggerKey = changes.triggerKey.newValue;
-    if (changes.enableScan) settings.enableScan = changes.enableScan.newValue;
-    if (changes.maxScanLength) settings.maxScanLength = changes.maxScanLength.newValue;
-    if (changes.autoAiExamples !== undefined) settings.autoAiExamples = changes.autoAiExamples.newValue;
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local' || !areaName) {
+      if (changes.triggerKey) settings.triggerKey = changes.triggerKey.newValue;
+      if (changes.enableScan !== undefined) {
+        settings.enableScan = changes.enableScan.newValue === true || changes.enableScan.newValue === 'true';
+        if (!settings.enableScan) {
+          removePopup();
+          lastLookupQuery = '';
+        }
+      }
+      if (changes.maxScanLength) settings.maxScanLength = changes.maxScanLength.newValue;
+      if (changes.autoAiExamples !== undefined) settings.autoAiExamples = changes.autoAiExamples.newValue;
+    }
+  });
+
+  // Real-time synchronization via direct messages from popup, options, and service worker
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'SET_SCAN_ENABLED') {
+      settings.enableScan = message.enableScan === true || message.enableScan === 'true';
+      if (!settings.enableScan) {
+        removePopup();
+        lastLookupQuery = '';
+      }
+      sendResponse({ success: true, enableScan: settings.enableScan });
+      return true;
+    }
+    if (message?.type === 'SETTINGS_UPDATED') {
+      if (message.payload?.enableScan !== undefined) {
+        settings.enableScan = message.payload.enableScan === true || message.payload.enableScan === 'true';
+        if (!settings.enableScan) {
+          removePopup();
+          lastLookupQuery = '';
+        }
+      }
+      if (message.payload?.triggerKey) settings.triggerKey = message.payload.triggerKey;
+      if (message.payload?.maxScanLength) settings.maxScanLength = message.payload.maxScanLength;
+      sendResponse({ success: true });
+      return true;
+    }
   });
 
   /**
@@ -1037,7 +1073,7 @@
    * Mousemove + Trigger key handler (Capturing Phase)
    */
   document.addEventListener('mousemove', (e) => {
-    if (!settings.enableScan) return;
+    if (!settings.enableScan || settings.triggerKey === 'none') return;
 
     // Check trigger key condition
     let isTriggered = false;
