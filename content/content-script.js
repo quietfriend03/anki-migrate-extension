@@ -673,7 +673,7 @@
     chrome.runtime.sendMessage(
       {
         type: 'CHECK_NOTE_EXISTS',
-        payload: { word: activeWordData.word }
+        payload: { word: activeWordData.word, reading: activeWordData.reading }
       },
       (res) => {
         if (res && res.success && res.data && res.data.exists) {

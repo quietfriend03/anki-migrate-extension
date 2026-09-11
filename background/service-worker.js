@@ -1329,11 +1329,35 @@ function extractFromExampleBlock(block) {
 }
 
 /**
+ * Clean and normalize an Anki field value for headword comparison:
+ * - Strips <rt>...</rt> furigana ruby text
+ * - Strips all HTML tags
+ * - Strips bracketed furigana/readings e.g. [ぬの], (ぬの), 【ぬの】
+ * - Strips surrounding quotes, brackets, and punctuation
+ */
+function cleanAnkiWordFieldValue(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let t = raw;
+  // 1. Remove ruby rt tags (furigana text) e.g. <ruby>布<rt>ぬの</rt></ruby> -> <ruby>布</ruby>
+  t = t.replace(/<rt[^>]*>[\s\S]*?<\/rt>/gi, '');
+  // 2. Remove all HTML tags
+  t = t.replace(/<[^>]+>/g, ' ');
+  // 3. Remove bracketed furigana/readings e.g. [ぬの], (ぬの), 【ぬの】, （ぬの）
+  t = t.replace(/\s*[\[\(（【][^\]\)）】]*[\]\)）】]/g, '');
+  // 4. Strip punctuation, quotes, leading/trailing symbols e.g. 「布」, "布", 〜布
+  t = t.replace(/^[「『"'\s\.,:;\-~〜・\[\]\(\)]+|[」』"'\s\.,:;\-~〜・\[\]\(\)]+$/g, '');
+  return t.trim();
+}
+
+/**
  * Check if a note already exists in the target Anki deck
  */
-async function handleCheckNoteExists({ word, deckName }) {
+async function handleCheckNoteExists({ word, reading, deckName }) {
   if (!word) return { exists: false };
   const cleanWord = word.trim();
+  if (!cleanWord) return { exists: false };
+  const cleanReading = (reading || '').trim();
+  const hasKanji = /[\u4e00-\u9faf]/.test(cleanWord);
 
   const config = await chrome.storage.local.get({
     ankiUrl: 'http://localhost:8765',
@@ -1341,10 +1365,13 @@ async function handleCheckNoteExists({ word, deckName }) {
   });
 
   const ankiUrl = config.ankiUrl || 'http://localhost:8765';
-  const targetDeck = (deckName || config.deckName || 'Japanese_Learning').trim();
+  const targetDeck = (deckName || config.deckName || '').trim();
 
   try {
-    const query = `deck:"${targetDeck}" "${cleanWord}"`;
+    const escapedWord = cleanWord.replace(/["\\]/g, '\\$&');
+    const deckClause = targetDeck ? `deck:"${targetDeck.replace(/["\\]/g, '\\$&')}" ` : '';
+    const query = `${deckClause}"${escapedWord}"`;
+
     const res = await fetch(ankiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1362,36 +1389,59 @@ async function handleCheckNoteExists({ word, deckName }) {
       return { exists: false };
     }
 
-    // Verify against note fields
+    // Verify against note fields (inspect up to 50 candidate notes)
     const resInfo = await fetch(ankiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: 'notesInfo',
         version: 6,
-        params: { notes: noteIds.slice(0, 10) }
+        params: { notes: noteIds.slice(0, 50) }
       })
     });
 
-    if (resInfo.ok) {
-      const dataInfo = await resInfo.json();
-      const notes = dataInfo.result || [];
-      for (const n of notes) {
-        const fields = n.fields || {};
-        for (const [key, valObj] of Object.entries(fields)) {
-          const val = (valObj.value || '').trim();
-          if (val === cleanWord) {
-            return { exists: true, noteId: n.noteId };
-          }
-          const plain = val.replace(/<[^>]*>/g, '').trim();
-          if (plain === cleanWord || plain.startsWith(cleanWord + '\n') || plain.startsWith(cleanWord + ' ')) {
-            return { exists: true, noteId: n.noteId };
-          }
+    if (!resInfo.ok) return { exists: false };
+    const dataInfo = await resInfo.json();
+    const notes = dataInfo.result || [];
+
+    // Ignored field patterns: definitions, audio, images, sentences, notes, and card back
+    const ignoredFieldPattern =
+      /meaning|definition|glossary|dịch|nghĩa|audio|sound|âm thanh|pronunciation|phát âm|picture|image|ảnh|hình|example|sentence|ví dụ|cau vi du|tatoeba|notes|note|comment|ghi chú|back|mặt sau|hint|gợi ý/i;
+
+    for (const n of notes) {
+      const fields = n.fields || {};
+      // Sort fields so order: 0 (the primary/sort field) is evaluated first
+      const sortedFields = Object.entries(fields).sort((a, b) => (a[1]?.order ?? 99) - (b[1]?.order ?? 99));
+
+      for (const [key, valObj] of sortedFields) {
+        if (ignoredFieldPattern.test(key)) {
+          continue;
+        }
+
+        const rawVal = (valObj?.value || '').trim();
+        if (!rawVal) continue;
+
+        // Exact match before cleaning
+        if (rawVal === cleanWord || (!hasKanji && cleanReading && rawVal === cleanReading)) {
+          return { exists: true, noteId: n.noteId };
+        }
+
+        // Cleaned value match (furigana/html/brackets stripped)
+        const cleaned = cleanAnkiWordFieldValue(rawVal);
+        if (cleaned === cleanWord || (!hasKanji && cleanReading && cleaned === cleanReading)) {
+          return { exists: true, noteId: n.noteId };
+        }
+
+        // Split multiple headword tokens e.g. "布; 織物" or "布\nぬの"
+        const tokens = cleaned.split(/[\n\/;,、，]+/).map((s) => s.trim()).filter(Boolean);
+        if (tokens.includes(cleanWord) || (!hasKanji && cleanReading && tokens.includes(cleanReading))) {
+          return { exists: true, noteId: n.noteId };
         }
       }
     }
 
-    return { exists: noteIds.length > 0, noteId: noteIds[0] };
+    // None of the candidate notes matched the target word in their word fields
+    return { exists: false };
   } catch (err) {
     console.warn('[Anki] checkNoteExists error:', err);
     return { exists: false };
@@ -1649,9 +1699,20 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
   const cleanDefinition = (definition || '').trim();
 
   // Check duplicate before proceeding
-  const existCheck = await handleCheckNoteExists({ word: cleanWord, deckName });
+  const existCheck = await handleCheckNoteExists({ word: cleanWord, reading: cleanReading, deckName });
   if (existCheck.exists) {
     throw new Error(`Từ "${cleanWord}" đã tồn tại trong deck "${deckName}" của Anki.`);
+  }
+
+  // Ensure target deck exists
+  try {
+    await fetch(ankiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'createDeck', version: 6, params: { deck: deckName } })
+    });
+  } catch (e) {
+    console.warn('[Anki] Could not ensure deck exists:', e);
   }
 
   const providedExample = aiExample || (example && typeof example === 'object' ? example : null);

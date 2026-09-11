@@ -375,7 +375,7 @@ function renderResults(data) {
     chrome.runtime.sendMessage(
       {
         type: 'CHECK_NOTE_EXISTS',
-        payload: { word: item.term }
+        payload: { word: item.term, reading: item.reading }
       },
       (res) => {
         if (res && res.success && res.data && res.data.exists) {
