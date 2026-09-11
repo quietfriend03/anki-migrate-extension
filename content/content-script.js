@@ -231,8 +231,6 @@
       }
 
       .jlex-sc-exampleSentence,
-      .jlex-sc-example-sentence-b,
-      .jlex-sc-example-sentence-a,
       .jlex-sc-example-sentence {
         display: block;
         background: #f8fafc;
@@ -244,16 +242,23 @@
         color: #1e293b;
       }
 
+      .jlex-sc-example-sentence-a {
+        display: block;
+        color: #1e293b;
+        line-height: 1.8;
+      }
+
+      .jlex-sc-example-sentence-b,
       .jlex-sc-exampleSentence [lang="en"],
       .jlex-sc-exampleSentence [lang="vi"],
-      .jlex-sc-example-sentence-b [lang="en"],
-      .jlex-sc-example-sentence-a [lang="en"],
-      .jlex-sc-example-sentence [lang="en"] {
+      .jlex-sc-example-sentence [lang="en"],
+      .jlex-sc-example-sentence [lang="vi"] {
         display: block;
         color: #64748b;
         font-style: italic;
-        margin-top: 3px;
+        margin-top: 4px;
         font-size: 11.5px;
+        line-height: 1.45;
       }
 
       .jlex-sc-forms,

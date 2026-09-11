@@ -115,6 +115,16 @@ function formatPosToEnglish(posList) {
  */
 const translationCache = new Map();
 
+let gtxQueue = Promise.resolve();
+function throttledGtxFetch(url) {
+  const current = gtxQueue.then(async () => {
+    await new Promise((r) => setTimeout(r, 60));
+    return fetch(url);
+  });
+  gtxQueue = current.catch(() => {});
+  return current;
+}
+
 async function translateToVietnamese(text, sourceLang = 'en') {
   if (!text || typeof text !== 'string') return '';
   const trimmed = text.trim();
@@ -132,12 +142,24 @@ async function translateToVietnamese(text, sourceLang = 'en') {
 
   try {
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=vi&dt=t&q=${encodeURIComponent(trimmed)}`;
-    const res = await fetch(url);
-    if (res.ok) {
+    const res = await throttledGtxFetch(url);
+    if (res && res.ok) {
       const data = await res.json();
       if (data && Array.isArray(data[0])) {
         const viText = data[0].map((segment) => segment[0]).filter(Boolean).join('');
         if (viText) {
+          const isSameAsInput = viText.trim().toLowerCase() === trimmed.toLowerCase();
+          const hasJapanese = /[\u3040-\u30ff\u4e00-\u9faf]/.test(viText);
+          const hasVietnamese = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(viText);
+
+          // If source was Japanese, reject result if it still contains Japanese or is identical to input
+          if (sourceLang === 'ja') {
+            if (isSameAsInput || (hasJapanese && !hasVietnamese)) {
+              console.warn('[Translate] GTX returned untranslated Japanese text');
+              return '';
+            }
+          }
+
           translationCache.set(cacheKey, viText);
           return viText;
         }
@@ -147,7 +169,72 @@ async function translateToVietnamese(text, sourceLang = 'en') {
     console.warn('[Translate] Error translating to Vietnamese:', err);
   }
 
+  // Never return raw Japanese text as Vietnamese translation!
+  if (sourceLang === 'ja' || /[\u3040-\u30ff\u4e00-\u9faf]/.test(trimmed)) {
+    return '';
+  }
+
   return trimmed;
+}
+
+/**
+ * Fallback to Gemini AI for sentence translation if Google Translate GTX fails or rate-limits
+ */
+async function translateSentenceWithGemini(sentence, sourceLang = 'ja') {
+  if (!sentence) return '';
+  try {
+    const config = await chrome.storage.local.get({
+      geminiApiKey: '',
+      geminiModel: 'gemini-3.6-flash'
+    });
+    if (!config.geminiApiKey) return '';
+
+    const cacheKey = `gemini-trans:${sentence}`;
+    if (translationCache.has(cacheKey)) {
+      return translationCache.get(cacheKey);
+    }
+
+    const langName = sourceLang === 'en' ? 'tiếng Anh' : 'tiếng Nhật';
+    const prompt = `Dịch câu ví dụ sau từ ${langName} sang tiếng Việt chuẩn xác, tự nhiên, ngắn gọn (chỉ trả về một câu tiếng Việt duy nhất, không giải thích hay thêm dấu ngoặc kép):\n"${sentence}"`;
+    const requestBody = {
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 256
+      }
+    };
+
+    const data = await callGeminiApi(config.geminiApiKey, config.geminiModel || 'gemini-3.6-flash', requestBody);
+    const candidateText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const cleanVi = candidateText.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+    if (cleanVi && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(cleanVi)) {
+      translationCache.set(cacheKey, cleanVi);
+      return cleanVi;
+    }
+  } catch (err) {
+    console.warn('[Gemini Translate Fallback] Error:', err);
+  }
+  return '';
+}
+
+/**
+ * Helper: Extract plain text recursively from a structured content node
+ */
+function extractTextFromNode(node) {
+  if (!node) return '';
+  if (typeof node === 'string') return node;
+  if (typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(extractTextFromNode).join(' ');
+  if (typeof node === 'object') {
+    if (node.tag === 'rt' || node.tag === 'rp') return '';
+    if (node.content !== undefined) return extractTextFromNode(node.content);
+  }
+  return '';
 }
 
 /**
@@ -164,11 +251,22 @@ function extractJapaneseTextFromNode(node) {
   if (typeof node === 'object') {
     if (node.tag === 'rt' || node.tag === 'rp') return ''; // Skip readings
     if (node.lang === 'en' || node.lang === 'vi') return ''; // Skip translations
+    if (node.data && typeof node.data === 'object' && node.data.content === 'example-sentence-b') return '';
     if (node.content !== undefined) {
       return extractJapaneseTextFromNode(node.content);
     }
   }
   return '';
+}
+
+/**
+ * Helper: Check if a node is explicitly the translation container of an example
+ */
+function isTranslationNode(node) {
+  if (!node || typeof node !== 'object') return false;
+  if (node.lang === 'en' || node.lang === 'vi') return true;
+  if (node.data && typeof node.data === 'object' && node.data.content === 'example-sentence-b') return true;
+  return false;
 }
 
 /**
@@ -208,9 +306,10 @@ function sanitizeVietnameseTranslation(viText, jaText = '') {
  */
 async function translateExampleSentenceToVietnamese({ ja = '', en = '' }) {
   const cleanJa = (ja || '').replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+  const cleanEn = (en || '').replace(/<[^>]*>/g, '').trim();
   let vi = '';
 
-  // 1. Translate directly from original Japanese sentence
+  // 1. Translate directly from original Japanese sentence via GTX
   if (cleanJa && /[\u3040-\u30ff\u4e00-\u9faf]/.test(cleanJa)) {
     try {
       vi = await translateToVietnamese(cleanJa, 'ja');
@@ -218,16 +317,25 @@ async function translateExampleSentenceToVietnamese({ ja = '', en = '' }) {
   }
 
   // 2. Fallback to English translation if Japanese translation failed or was empty
-  if (!vi && en) {
-    const cleanEn = (en || '').replace(/<[^>]*>/g, '').trim();
-    if (cleanEn) {
-      try {
-        vi = await translateToVietnamese(cleanEn, 'en');
-      } catch (_) {}
-    }
+  if (!vi && cleanEn) {
+    try {
+      const enVi = await translateToVietnamese(cleanEn, 'en');
+      if (enVi && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(enVi) && enVi !== cleanEn) {
+        vi = enVi;
+      }
+    } catch (_) {}
   }
 
-  return sanitizeVietnameseTranslation(vi || en, cleanJa);
+  // 3. Fallback to Gemini AI if GTX failed or was rate-limited
+  if (!vi && (cleanJa || cleanEn)) {
+    try {
+      vi = await translateSentenceWithGemini(cleanJa || cleanEn, cleanJa ? 'ja' : 'en');
+    } catch (_) {}
+  }
+
+  // 4. If all translation attempts failed, NEVER return Japanese text! Fallback to cleanEn if available
+  const finalResult = vi || cleanEn || '';
+  return sanitizeVietnameseTranslation(finalResult, cleanJa);
 }
 
 /**
@@ -240,7 +348,7 @@ async function translateExampleSentencesInNode(node, isInsideExample = false, cu
 
   if (typeof node === 'string') {
     if (isInsideExample && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(node) && node.trim().length > 1) {
-      return await translateExampleSentenceToVietnamese({ ja: currentJa, en: node });
+      return await translateExampleSentenceToVietnamese({ ja: currentJa, en: node.trim() });
     }
     return node;
   }
@@ -250,9 +358,9 @@ async function translateExampleSentencesInNode(node, isInsideExample = false, cu
   }
 
   if (typeof node === 'object') {
-    const isExampleNode = isInsideExample || (node.data && typeof node.data === 'object' && /example/i.test(node.data.content));
+    const isExampleContainer = isInsideExample || (node.data && typeof node.data === 'object' && /example/i.test(node.data.content));
     let jaText = currentJa;
-    if (isExampleNode && !jaText) {
+    if (isExampleContainer && !jaText) {
       jaText = extractJapaneseTextFromNode(node);
     }
 
@@ -265,20 +373,25 @@ async function translateExampleSentencesInNode(node, isInsideExample = false, cu
       };
     }
 
-    // Explicit English translation element inside example sentence: { tag: "div", lang: "en", content: "..." }
-    if (isExampleNode && node.lang === 'en') {
-      const newNode = { ...node, lang: 'vi' };
-      if (typeof node.content === 'string') {
-        newNode.content = await translateExampleSentenceToVietnamese({ ja: jaText, en: node.content });
-      } else if (node.content !== undefined) {
-        newNode.content = await translateExampleSentencesInNode(node.content, true, jaText);
-      }
-      return newNode;
+    // Explicit translation element inside example sentence (e.g. data-sc-content="example-sentence-b" or lang="en")
+    const isTranslation = isInsideExample && (
+      isTranslationNode(node) ||
+      (!/[\u3040-\u30ff\u4e00-\u9faf]/.test(extractTextFromNode(node)) && extractTextFromNode(node).trim().length > 1 && (node.tag === 'div' || node.tag === 'span' || node.tag === 'p'))
+    );
+
+    if (isTranslation) {
+      const enText = extractTextFromNode(node).trim();
+      const viTrans = await translateExampleSentenceToVietnamese({ ja: jaText, en: enText });
+      return {
+        ...node,
+        lang: 'vi',
+        content: viTrans
+      };
     }
 
     const newNode = { ...node };
     if (node.content !== undefined) {
-      newNode.content = await translateExampleSentencesInNode(node.content, isExampleNode, jaText);
+      newNode.content = await translateExampleSentencesInNode(node.content, isExampleContainer, jaText);
     }
     return newNode;
   }
