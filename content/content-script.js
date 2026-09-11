@@ -15,6 +15,9 @@
   let currentAudio = null;
   let lastLookupQuery = '';
   let activeWordData = null;
+  let lastMouseX = null;
+  let lastMouseY = null;
+  let scanTimer = null;
 
   // Configuration (sync with storage)
   let settings = {
@@ -380,6 +383,10 @@
       currentPopup = null;
       activeWordData = null;
     }
+    if (shadowRoot) {
+      shadowRoot.innerHTML = '';
+    }
+    lastLookupQuery = '';
   }
 
   /**
@@ -999,7 +1006,29 @@
   }
 
   /**
-   * Get text node at point and extract text stream
+   * Helper: Walk forward in DOM tree to find next text node inside a container
+   */
+  function getNextTextNode(node, root) {
+    if (!node) return null;
+    if (node.firstChild && node.nodeName !== 'RT' && node.nodeName !== 'RP') {
+      return node.firstChild;
+    }
+    while (node && node !== root) {
+      if (node.nextSibling) {
+        let next = node.nextSibling;
+        if (next.nodeName === 'RT' || next.nodeName === 'RP') {
+          node = next;
+          continue;
+        }
+        return next;
+      }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  /**
+   * Get text node at point and extract text stream across sibling/descendant nodes
    */
   function getTextAtPoint(x, y) {
     let range;
@@ -1036,8 +1065,66 @@
 
     if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return null;
 
-    const text = textNode.nodeValue || '';
-    return text.slice(offset, offset + settings.maxScanLength);
+    // Ignore text inside <rt> or <rp> (Furigana annotations)
+    const pTag = textNode.parentNode?.nodeName;
+    if (pTag === 'RT' || pTag === 'RP') return null;
+
+    const maxLen = settings.maxScanLength || 16;
+    let fullText = (textNode.nodeValue || '').slice(offset);
+
+    // Find bounding block container so we don't cross into totally unrelated paragraphs
+    const container =
+      textNode.parentElement?.closest?.('p, div, li, td, th, h1, h2, h3, h4, h5, h6, article, section, blockquote') ||
+      document.body;
+
+    let curr = textNode;
+    while (fullText.length < maxLen) {
+      curr = getNextTextNode(curr, container);
+      if (!curr) break;
+      if (curr.nodeType === Node.TEXT_NODE) {
+        const parentTag = curr.parentNode?.nodeName;
+        if (parentTag !== 'RT' && parentTag !== 'RP') {
+          fullText += curr.nodeValue || '';
+        }
+      }
+    }
+
+    return fullText.slice(0, maxLen).trim();
+  }
+
+  /**
+   * Core scan function at (x, y)
+   */
+  function scanAtPoint(x, y) {
+    if (!settings.enableScan || settings.triggerKey === 'none') return;
+
+    // Ignore scanning if cursor is inside our own popup
+    if (hostElement && currentPopup) {
+      const rect = currentPopup.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return;
+      }
+    }
+
+    const textAhead = getTextAtPoint(x, y);
+    if (!textAhead || !hasJapanese(textAhead)) return;
+
+    // Don't re-query identical text while popup is already open
+    if (textAhead === lastLookupQuery && currentPopup) return;
+    lastLookupQuery = textAhead;
+
+    chrome.runtime.sendMessage(
+      {
+        type: 'LOOKUP_TERM',
+        payload: { text: textAhead, maxScanLength: settings.maxScanLength }
+      },
+      (response) => {
+        if (!settings.enableScan) return;
+        if (response && response.success && (response.data.matches.length > 0 || response.data.directHanviet)) {
+          renderPopup(response.data, x, y);
+        }
+      }
+    );
   }
 
   /**
@@ -1070,9 +1157,12 @@
   }
 
   /**
-   * Mousemove + Trigger key handler (Capturing Phase)
+   * Mousemove handler with smooth 35ms throttling (~30fps)
    */
   document.addEventListener('mousemove', (e) => {
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+
     if (!settings.enableScan || settings.triggerKey === 'none') return;
 
     // Check trigger key condition
@@ -1083,29 +1173,59 @@
 
     if (!isTriggered) return;
 
-    const textAhead = getTextAtPoint(e.clientX, e.clientY);
-    if (!textAhead || !hasJapanese(textAhead)) return;
-
-    if (textAhead === lastLookupQuery) return;
-    lastLookupQuery = textAhead;
-
-    chrome.runtime.sendMessage(
-      {
-        type: 'LOOKUP_TERM',
-        payload: { text: textAhead, maxScanLength: settings.maxScanLength }
-      },
-      (response) => {
-        if (response && response.success && (response.data.matches.length > 0 || response.data.directHanviet)) {
-          renderPopup(response.data, e.clientX, e.clientY);
-        }
+    // Smooth throttle: at most 1 scan per 35ms (~30fps) for silky smooth cursor tracking
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
+      if (lastMouseX !== null && lastMouseY !== null) {
+        scanAtPoint(lastMouseX, lastMouseY);
       }
-    );
+    }, 35);
+  }, true);
+
+  /**
+   * Keydown handler: instant scan on trigger key press (0ms latency!)
+   */
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && currentPopup) {
+      removePopup();
+      return;
+    }
+
+    if (!settings.enableScan || settings.triggerKey === 'none') return;
+    if (e.repeat) return; // ignore auto-repeat while held down
+
+    let isTrigger = false;
+    if (settings.triggerKey === 'Shift' && e.key === 'Shift') isTrigger = true;
+    else if (settings.triggerKey === 'Alt' && e.key === 'Alt') isTrigger = true;
+    else if (settings.triggerKey === 'Ctrl' && (e.key === 'Control' || e.key === 'Meta')) isTrigger = true;
+
+    if (isTrigger && lastMouseX !== null && lastMouseY !== null) {
+      scanAtPoint(lastMouseX, lastMouseY);
+    }
+  }, true);
+
+  /**
+   * Keyup handler: clear lastLookupQuery when trigger key is released
+   */
+  document.addEventListener('keyup', (e) => {
+    let isTrigger = false;
+    if (settings.triggerKey === 'Shift' && e.key === 'Shift') isTrigger = true;
+    else if (settings.triggerKey === 'Alt' && e.key === 'Alt') isTrigger = true;
+    else if (settings.triggerKey === 'Ctrl' && (e.key === 'Control' || e.key === 'Meta')) isTrigger = true;
+
+    if (isTrigger) {
+      lastLookupQuery = '';
+    }
   }, true);
 
   /**
    * Mouseup handler for selected text (Capturing Phase)
    */
   document.addEventListener('mouseup', (e) => {
+    // If scanning is disabled, DO NOT open popup on mouseup
+    if (!settings.enableScan) return;
+
     // Ignore click inside our own shadow popup
     if (hostElement && e.composedPath().includes(hostElement)) return;
 
@@ -1118,6 +1238,7 @@
         payload: { text: selectedText, maxScanLength: settings.maxScanLength }
       },
       (response) => {
+        if (!settings.enableScan) return;
         if (response && response.success && (response.data.matches.length > 0 || response.data.directHanviet)) {
           renderPopup(response.data, e.clientX, e.clientY);
         }
@@ -1130,12 +1251,6 @@
    */
   document.addEventListener('mousedown', (e) => {
     if (currentPopup && hostElement && !e.composedPath().includes(hostElement)) {
-      removePopup();
-    }
-  }, true);
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && currentPopup) {
       removePopup();
     }
   }, true);
