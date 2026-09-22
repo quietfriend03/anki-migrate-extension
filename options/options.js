@@ -125,7 +125,7 @@ function showToast(message) {
 async function loadSettings() {
   const config = await chrome.storage.local.get({
     geminiApiKey: '',
-    geminiModel: 'gemini-2.5-flash',
+    geminiModel: 'gemini-3.5-flash-lite',
     geminiPrompt: '',
     ankiUrl: 'http://localhost:8765',
     deckName: 'Japanese_Learning',
@@ -146,10 +146,10 @@ async function loadSettings() {
 
   // Gemini
   geminiApiKeyInput.value = config.geminiApiKey;
-  let modelVal = (config.geminiModel || 'gemini-2.5-flash').trim();
-  if (modelVal.startsWith('gemma-')) {
-    modelVal = 'gemini-2.5-flash';
-    await chrome.storage.local.set({ geminiModel: 'gemini-2.5-flash' });
+  let modelVal = (config.geminiModel || 'gemini-3.5-flash-lite').trim();
+  if (modelVal.startsWith('gemma-') || ['gemini-2.5-flash', 'gemini-3.6-flash'].includes(modelVal)) {
+    modelVal = 'gemini-3.5-flash-lite';
+    await chrome.storage.local.set({ geminiModel: 'gemini-3.5-flash-lite' });
   }
 
   // Ensure modelVal exists as an option in geminiModelSelect

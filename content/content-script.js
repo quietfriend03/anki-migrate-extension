@@ -833,7 +833,7 @@
     // Anki Click
     ankiBtn.onclick = () => {
       ankiBtn.disabled = true;
-      ankiBtn.innerHTML = `<span>⏳ Đang tạo ví dụ AI & lưu Anki...</span>`;
+      ankiBtn.innerHTML = `<span>⏳ Đang lưu vào Anki...</span>`;
       statusMsg.textContent = '';
 
       chrome.runtime.sendMessage(
@@ -863,7 +863,7 @@
             ankiBtn.style.cursor = 'not-allowed';
             ankiBtn.style.opacity = '0.85';
             statusMsg.className = 'jlex-status-msg jlex-status-success';
-            statusMsg.textContent = '✓ Đã tạo ví dụ & lưu vào Anki thành công!';
+            statusMsg.textContent = '✓ Đã lưu vào Anki thành công!';
           } else {
             const errStr = res?.error || '';
             if (errStr.includes('đã tồn tại') || errStr.includes('duplicate') || errStr.includes('đã có')) {

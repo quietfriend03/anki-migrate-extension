@@ -6,10 +6,17 @@
 import { dictDB } from '../lib/db.js';
 import { hanvietLookup } from '../lib/hanviet-lookup.js';
 
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 const GEMINI_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 const geminiModelsCache = new Map();
 const geminiModelCooldowns = new Map();
+const lookupCache = new Map();
+const LOOKUP_CACHE_TTL_MS = 2 * 60 * 1000;
+const ankiDuplicateCache = new Map();
+const ANKI_DUPLICATE_CACHE_TTL_MS = 15 * 1000;
+const ankiModelInfoCache = new Map();
+const ANKI_MODEL_INFO_CACHE_TTL_MS = 5 * 60 * 1000;
+const ensuredAnkiDecks = new Set();
 
 // Initialize DB and Han-Viet dataset
 let isReady = false;
@@ -120,14 +127,28 @@ function formatPosToEnglish(posList) {
  */
 const translationCache = new Map();
 
-let gtxQueue = Promise.resolve();
+const GTX_MAX_CONCURRENT_REQUESTS = 4;
+let activeGtxRequests = 0;
+const pendingGtxRequests = [];
+
+function drainGtxQueue() {
+  while (activeGtxRequests < GTX_MAX_CONCURRENT_REQUESTS && pendingGtxRequests.length > 0) {
+    const { url, resolve, reject } = pendingGtxRequests.shift();
+    activeGtxRequests += 1;
+    fetch(url)
+      .then(resolve, reject)
+      .finally(() => {
+        activeGtxRequests -= 1;
+        drainGtxQueue();
+      });
+  }
+}
+
 function throttledGtxFetch(url) {
-  const current = gtxQueue.then(async () => {
-    await new Promise((r) => setTimeout(r, 60));
-    return fetch(url);
+  return new Promise((resolve, reject) => {
+    pendingGtxRequests.push({ url, resolve, reject });
+    drainGtxQueue();
   });
-  gtxQueue = current.catch(() => {});
-  return current;
 }
 
 async function translateToVietnamese(text, sourceLang = 'en') {
@@ -567,37 +588,44 @@ function hasExampleSentence(definitions) {
 async function handleLookup({ text, maxScanLength = 16 }) {
   if (!text) return { matches: [], matchedText: '', hanviet: null };
 
+  const cacheKey = `${maxScanLength}:${text}`;
+  const cached = lookupCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt < LOOKUP_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const scanResult = await dictDB.searchScan(text, maxScanLength);
 
   if (scanResult && scanResult.matches && scanResult.matches.length > 0) {
-    // Enrich each match with Hán-Việt readings & English definitions + Vietnamese example sentences
-    const enrichedMatches = await Promise.all(
-      scanResult.matches.map(async (item) => {
+    // Translate dictionary examples before returning so the first render is
+    // complete and the UI never has to reload itself after opening.
+    const enrichedMatches = await Promise.all(scanResult.matches.map(async (item) => {
         const hanviet = hanvietLookup.lookupWord(item.term);
-        const enrichedDefs = item.definitions && item.definitions.length > 0
-          ? await Promise.all(item.definitions.map((d) => translateExampleSentencesInNode(d)))
-          : [];
-
         const enPos = formatPosToEnglish(item.definitionTags || item.rules || []);
-        const hasExample = hasExampleSentence(enrichedDefs);
+        const definitions = item.definitions && item.definitions.length > 0
+          ? await Promise.all(item.definitions.map((definition) => translateExampleSentencesInNode(definition)))
+          : [];
+        const hasExample = hasExampleSentence(definitions);
 
         return {
           ...item,
           hanviet,
           enPos,
           viPos: enPos, // Backward compatible property
-          definitions: enrichedDefs,
+          definitions,
           hasExample
         };
-      })
-    );
+      }));
 
-    return {
+    const result = {
       matchedText: scanResult.matchedText,
       matchedLength: scanResult.matchedLength,
       dictionaryForm: scanResult.dictionaryForm,
       matches: enrichedMatches
     };
+    lookupCache.set(cacheKey, { data: result, createdAt: Date.now() });
+    if (lookupCache.size > 200) lookupCache.delete(lookupCache.keys().next().value);
+    return result;
   }
 
   // If no dictionary match found, check Hán-Việt + online Japanese-to-Vietnamese translation
@@ -637,24 +665,22 @@ async function handleLookup({ text, maxScanLength = 16 }) {
 async function handleLookupExact({ text }) {
   if (!text) return [];
   const matches = await dictDB.findExact(text);
-  return await Promise.all(
-    matches.map(async (item) => {
+  return Promise.all(matches.map(async (item) => {
       const hanviet = hanvietLookup.lookupWord(item.term);
-      const enrichedDefs = item.definitions && item.definitions.length > 0
-        ? await Promise.all(item.definitions.map((d) => translateExampleSentencesInNode(d)))
-        : [];
       const enPos = formatPosToEnglish(item.definitionTags || item.rules || []);
-      const hasExample = hasExampleSentence(enrichedDefs);
+      const definitions = item.definitions && item.definitions.length > 0
+        ? await Promise.all(item.definitions.map((definition) => translateExampleSentencesInNode(definition)))
+        : [];
+      const hasExample = hasExampleSentence(definitions);
       return {
         ...item,
         hanviet,
         enPos,
         viPos: enPos,
-        definitions: enrichedDefs,
+        definitions,
         hasExample
       };
-    })
-  );
+    }));
 }
 
 /**
@@ -721,7 +747,9 @@ async function fetchAvailableGeminiModels(apiKey, forceRefresh = false) {
 
 function normalizeGeminiModelName(model) {
   const clean = String(model || DEFAULT_GEMINI_MODEL).trim().replace(/^models\//, '');
-  if (!clean || clean.startsWith('gemma-')) return DEFAULT_GEMINI_MODEL;
+  if (!clean || clean.startsWith('gemma-') || ['gemini-2.5-flash', 'gemini-3.6-flash'].includes(clean)) {
+    return DEFAULT_GEMINI_MODEL;
+  }
   return clean;
 }
 
@@ -730,8 +758,8 @@ function rankGeminiModels(models, preferredModel) {
   const names = Array.from(new Set((models || []).map((m) => normalizeGeminiModelName(m.name || m))));
   const score = (name) => {
     if (name === preferred) return 0;
-    if (/^gemini-\d+(?:\.\d+)+-flash$/.test(name)) return 10;
-    if (/^gemini-\d+(?:\.\d+)+-flash-lite$/.test(name)) return 20;
+    if (/^gemini-\d+(?:\.\d+)+-flash-lite$/.test(name)) return 10;
+    if (/^gemini-\d+(?:\.\d+)+-flash$/.test(name)) return 20;
     if (/^gemini-\d+(?:\.\d+)+-pro$/.test(name)) return 30;
     if (name.includes('flash') && !/(?:preview|experimental|exp)/.test(name)) return 40;
     if (!/(?:preview|experimental|exp|latest)/.test(name)) return 50;
@@ -1045,7 +1073,7 @@ async function handleGeminiAnalyzeWord({ word, reading, definition, forceRegener
   if (!apiKey) return null;
 
   let model = (config.geminiModel || DEFAULT_GEMINI_MODEL).trim();
-  if (model.startsWith('gemma-')) {
+  if (model.startsWith('gemma-') || ['gemini-2.5-flash', 'gemini-3.6-flash'].includes(model)) {
     model = DEFAULT_GEMINI_MODEL;
   }
 
@@ -1549,6 +1577,11 @@ async function handleCheckNoteExists({ word, reading, deckName }) {
 
   const ankiUrl = config.ankiUrl || 'http://localhost:8765';
   const targetDeck = (deckName || config.deckName || '').trim();
+  const duplicateCacheKey = `${ankiUrl}\u0000${targetDeck}\u0000${cleanWord}\u0000${cleanReading}`;
+  const cachedDuplicate = ankiDuplicateCache.get(duplicateCacheKey);
+  if (cachedDuplicate && Date.now() - cachedDuplicate.checkedAt < ANKI_DUPLICATE_CACHE_TTL_MS) {
+    return cachedDuplicate.result;
+  }
 
   try {
     const escapedWord = cleanWord.replace(/["\\]/g, '\\$&');
@@ -1569,7 +1602,9 @@ async function handleCheckNoteExists({ word, reading, deckName }) {
     const data = await res.json();
     const noteIds = data.result || [];
     if (noteIds.length === 0) {
-      return { exists: false };
+      const result = { exists: false };
+      ankiDuplicateCache.set(duplicateCacheKey, { result, checkedAt: Date.now() });
+      return result;
     }
 
     // Verify against note fields (inspect up to 50 candidate notes)
@@ -1633,13 +1668,17 @@ async function handleCheckNoteExists({ word, reading, deckName }) {
               break;
             }
           }
-          return { exists: true, noteId: n.noteId };
+          const result = { exists: true, noteId: n.noteId };
+          ankiDuplicateCache.set(duplicateCacheKey, { result, checkedAt: Date.now() });
+          return result;
         }
       }
     }
 
     // None of the candidate notes matched the target word in their word fields
-    return { exists: false };
+    const result = { exists: false };
+    ankiDuplicateCache.set(duplicateCacheKey, { result, checkedAt: Date.now() });
+    return result;
   } catch (err) {
     console.warn('[Anki] checkNoteExists error:', err);
     return { exists: false };
@@ -2057,11 +2096,11 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
   });
 
   // Handle AI Example
+  // Only export an AI example explicitly supplied by the current UI. A cached
+  // example from an earlier lookup must not silently appear in a later card.
   const userAiEx = (providedExample && (providedExample.jp || providedExample.ex_ruby || providedExample.ex_furigana))
     ? providedExample
-    : (word && aiExampleCache.has(getAiExampleCacheKey(word, reading))
-        ? aiExampleCache.get(getAiExampleCacheKey(word, reading))
-        : null);
+    : null;
 
   let aiExample = null;
   if (userAiEx) {
@@ -2376,6 +2415,90 @@ async function handleGetAudioUrl({ word, reading }) {
   return { audioUrl: googleUrl };
 }
 
+async function ensureAnkiDeck(ankiUrl, deckName) {
+  const cacheKey = `${ankiUrl}\u0000${deckName}`;
+  if (ensuredAnkiDecks.has(cacheKey)) return;
+  const response = await fetch(ankiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'createDeck', version: 6, params: { deck: deckName } })
+  });
+  if (!response.ok) throw new Error(`Không thể kiểm tra deck Anki (${response.status})`);
+  const data = await response.json();
+  if (data.error) throw new Error(data.error);
+  ensuredAnkiDecks.add(cacheKey);
+}
+
+async function getCachedAnkiModelInfo(ankiUrl, requestedModel) {
+  const cacheKey = `${ankiUrl}\u0000${requestedModel}`;
+  const cached = ankiModelInfoCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt < ANKI_MODEL_INFO_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const fetchFields = async (modelName) => {
+    const response = await fetch(ankiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'modelFieldNames', version: 6, params: { modelName } })
+    });
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.error ? [] : (data.result || []);
+  };
+
+  let modelName = requestedModel;
+  let modelFields = await fetchFields(modelName);
+  if (modelFields.length === 0) {
+    const response = await fetch(ankiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'modelNames', version: 6 })
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const models = data.result || [];
+      modelName = models.find((name) => /linguist|japan/i.test(name)) || models[0] || requestedModel;
+      if (modelName !== requestedModel) modelFields = await fetchFields(modelName);
+    }
+  }
+
+  const result = { modelName, modelFields };
+  ankiModelInfoCache.set(cacheKey, { data: result, createdAt: Date.now() });
+  return result;
+}
+
+async function prepareAnkiAudioMedia({ ankiUrl, word, reading, audioUrl }) {
+  try {
+    const audioResult = await downloadAudioWithFallbackAndRetry({
+      word,
+      reading,
+      providedUrl: audioUrl,
+      maxRetries: 2
+    });
+    if (!audioResult?.success || !audioResult.buffer) return null;
+
+    const response = await fetch(ankiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'storeMediaFile',
+        version: 6,
+        params: {
+          filename: audioResult.filename,
+          data: bufferToBase64(audioResult.buffer)
+        }
+      })
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.error ? null : audioResult.filename;
+  } catch (error) {
+    console.warn('[Anki] Audio preparation failed:', error);
+    return null;
+  }
+}
+
 /**
  * Handle AnkiConnect export with Linguist Japanese Vocab Template, Native Audio Download & Stroke Order
  */
@@ -2416,21 +2539,29 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
     throw new Error(`Từ "${cleanWord}"${readingSuffix} đã tồn tại trong deck "${deckName}" của Anki.`);
   }
 
-  // Ensure target deck exists
-  try {
-    await fetch(ankiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'createDeck', version: 6, params: { deck: deckName } })
-    });
-  } catch (e) {
-    console.warn('[Anki] Could not ensure deck exists:', e);
-  }
+  // Start independent I/O immediately; these run while senses and Gemini are processed.
+  const deckPromise = ensureAnkiDeck(ankiUrl, deckName).catch((error) => {
+    console.warn('[Anki] Could not ensure deck exists:', error);
+  });
+  const modelInfoPromise = getCachedAnkiModelInfo(ankiUrl, modelName);
+  const audioMediaPromise = prepareAnkiAudioMedia({
+    ankiUrl,
+    word: cleanWord,
+    reading: cleanReading,
+    audioUrl
+  });
+  const kanjiChars = Array.from(new Set(cleanWord.match(/[\u4e00-\u9faf\u3400-\u4dbf]/g) || []));
+  const strokePrefetchPromise = Promise.all(kanjiChars.map((char) => getAnimatedKanjiSvg(char))).catch((error) => {
+    console.warn('[Anki] Stroke prefetch failed:', error);
+  });
 
   const providedExample = aiExample || (example && typeof example === 'object' ? example : null);
 
   // Parse once so dictionary grouping and Gemini sense_index use the exact same ordering.
   const parsedSenseGroups = await parseDictionarySenses(cleanDefinition, rawDefinitions);
+  const hasDictionaryExamples = parsedSenseGroups.some((group) =>
+    group.senses.some((sense) => Array.isArray(sense.examples) && sense.examples.length > 0)
+  ) || hasExampleSentence(Array.isArray(rawDefinitions) ? rawDefinitions : []);
   const definitionForAi = parsedSenseGroups.length > 0
     ? parsedSenseGroups.map((group) => {
         const posHeader = group.pos ? `[${group.pos}]\n` : '';
@@ -2438,68 +2569,40 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
       }).join('\n')
     : cleanDefinition.replace(/<li[^>]*>/gi, '\n').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // 1. Analyze word via Gemini AI if a key is present
+  // Gemini is only needed when the dictionary has no example and the user has
+  // not already generated one from the UI. Normal Anki exports stay local.
   let aiData = null;
-  try {
-    aiData = await handleGeminiAnalyzeWord({
+  if (!hasDictionaryExamples && !providedExample) {
+    try {
+      aiData = await handleGeminiAnalyzeWord({
+        word: cleanWord,
+        reading: cleanReading,
+        definition: definitionForAi
+      });
+    } catch (e) {
+      console.warn('[Anki] Gemini example generation skipped or failed:', e.message);
+    }
+  }
+
+  // Meaning rendering, stroke SVGs, Anki metadata, audio, and deck creation can overlap.
+  const [meaningHtml, kanjiCardsHtml, modelInfo, storedAudioFilename] = await Promise.all([
+    formatBeautifiedMeaningHtml({
+      aiData,
+      rawDefinition: cleanDefinition,
+      rawDefinitions,
+      parsedGroups: parsedSenseGroups,
       word: cleanWord,
       reading: cleanReading,
-      definition: definitionForAi
-    });
-  } catch (e) {
-    console.warn('[Anki] Gemini word analysis skipped or failed:', e.message);
-  }
+      providedExample
+    }),
+    strokePrefetchPromise.then(() => buildKanjiCardsHtml(cleanWord, aiData?.kanji_details || [])),
+    modelInfoPromise,
+    audioMediaPromise,
+    deckPromise
+  ]);
 
-  // 2. Construct Beautified Meaning HTML (English definitions & POS, Vietnamese translated example sentences)
-  const meaningHtml = await formatBeautifiedMeaningHtml({
-    aiData,
-    rawDefinition: cleanDefinition,
-    rawDefinitions,
-    parsedGroups: parsedSenseGroups,
-    word: cleanWord,
-    reading: cleanReading,
-    providedExample
-  });
-
-  // 3. Build Kanji Stroke Order Cards with Self-Writing Animations matching Image 2
-  const kanjiCardsHtml = await buildKanjiCardsHtml(cleanWord, aiData?.kanji_details || []);
-
-  // 4. Query available models and decks from AnkiConnect
-  let availableModels = [];
-  try {
-    const resM = await fetch(ankiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'modelNames', version: 6 })
-    });
-    if (resM.ok) {
-      const dataM = await resM.json();
-      availableModels = dataM.result || [];
-    }
-  } catch (e) {
-    console.warn('[Anki] Could not fetch models list:', e);
-  }
-
-  // If modelName does not exist in Anki, pick first suitable available model
-  if (availableModels.length > 0 && !availableModels.includes(modelName)) {
-    modelName = availableModels.find((m) => /linguist|japan/i.test(m)) || availableModels[0];
-  }
-
-  // 5. Fetch actual field names of target model
-  let modelFields = [];
-  try {
-    const resF = await fetch(ankiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'modelFieldNames', version: 6, params: { modelName } })
-    });
-    if (resF.ok) {
-      const dataF = await resF.json();
-      modelFields = dataF.result || [];
-    }
-  } catch (e) {
-    console.warn('[Anki] Could not fetch model fields:', e);
-  }
+  modelName = modelInfo.modelName || modelName;
+  const modelFields = modelInfo.modelFields || [];
 
   // 6. Map fields intelligently based on model structure
   const fields = {};
@@ -2589,46 +2692,7 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
     targetAudioField = 'Back';
   }
 
-  // 7. Download audio directly in extension with automatic retry and multi-source fallback,
-  // then upload to Anki via storeMediaFile. This avoids AnkiConnect python urllib 500 download crashes!
-  let storedAudioFilename = null;
-  if (targetAudioField) {
-    try {
-      const audioResult = await downloadAudioWithFallbackAndRetry({
-        word: cleanWord,
-        reading: cleanReading,
-        providedUrl: audioUrl,
-        maxRetries: 3
-      });
-
-      if (audioResult && audioResult.success && audioResult.buffer) {
-        const base64Data = bufferToBase64(audioResult.buffer);
-        const storeRes = await fetch(ankiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'storeMediaFile',
-            version: 6,
-            params: {
-              filename: audioResult.filename,
-              data: base64Data
-            }
-          })
-        });
-
-        if (storeRes.ok) {
-          const storeData = await storeRes.json();
-          if (!storeData.error) {
-            storedAudioFilename = audioResult.filename;
-          }
-        }
-      }
-    } catch (audioErr) {
-      console.warn('[Anki] Audio download or storeMediaFile failed after retries:', audioErr);
-    }
-  }
-
-  // 8. Attach [sound:filename] to the target audio field
+  // Attach the audio prepared in parallel to the selected field.
   if (storedAudioFilename && targetAudioField) {
     const currentVal = (fields[targetAudioField] || '').trim();
     if (!currentVal.includes(`[sound:${storedAudioFilename}]`)) {
@@ -2669,6 +2733,12 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
   if (result.error) {
     throw new Error(`AnkiConnect: ${result.error}`);
   }
+
+  const duplicateCacheKey = `${ankiUrl}\u0000${deckName}\u0000${cleanWord}\u0000${cleanReading}`;
+  ankiDuplicateCache.set(duplicateCacheKey, {
+    result: { exists: true, noteId: result.result },
+    checkedAt: Date.now()
+  });
 
   return { noteId: result.result };
 }
@@ -3306,7 +3376,7 @@ async function handleTestGemini({ apiKey, model = DEFAULT_GEMINI_MODEL }) {
   const availableModels = await fetchAvailableGeminiModels(apiKey, true);
 
   let targetModel = (model || DEFAULT_GEMINI_MODEL).trim().replace(/^models\//, '');
-  if (targetModel.startsWith('gemma-')) {
+  if (targetModel.startsWith('gemma-') || ['gemini-2.5-flash', 'gemini-3.6-flash'].includes(targetModel)) {
     targetModel = DEFAULT_GEMINI_MODEL;
   }
 

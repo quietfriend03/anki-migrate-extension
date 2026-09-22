@@ -449,7 +449,7 @@ function renderResults(data) {
 
     btnAddAnki.onclick = () => {
       btnAddAnki.disabled = true;
-      btnAddAnki.textContent = '⏳ Đang tạo ví dụ & lưu...';
+      btnAddAnki.textContent = '⏳ Đang lưu vào Anki...';
 
       chrome.runtime.sendMessage(
         {
