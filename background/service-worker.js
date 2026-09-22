@@ -1823,6 +1823,36 @@ function splitGlosses(value) {
     .filter(Boolean);
 }
 
+/**
+ * Jitendex variants sometimes place the raw example directly after the final
+ * English gloss without an example marker. Meanings in this dictionary are
+ * English, so a Japanese tail is example content and must not be rendered as
+ * part of the definition.
+ */
+function stripEmbeddedExampleTail(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  const japaneseIndex = text.search(/[\u3040-\u30ff\u4e00-\u9faf]/);
+  if (japaneseIndex <= 0) return japaneseIndex === 0 ? '' : text;
+  return text.slice(0, japaneseIndex).trim();
+}
+
+function isKnownExampleText(value, examples) {
+  const normalize = (text) => String(text || '')
+    .replace(/<rt>[\s\S]*?<\/rt>/gi, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[。.!?！？]+$/g, '')
+    .trim()
+    .toLowerCase();
+  const candidate = normalize(value);
+  if (!candidate) return false;
+  return (examples || []).some((example) => {
+    const jp = normalize(example?.jp);
+    const vi = normalize(example?.vi);
+    return candidate === jp || candidate === vi;
+  });
+}
+
 function dedupeExamples(examples) {
   const uniqueBySentence = new Map();
   (examples || []).forEach((example) => {
@@ -1907,6 +1937,7 @@ async function parseStructuredDictionarySenses(rawDefinitions) {
     const senses = [];
 
     for (const senseNode of senseNodes) {
+      const examples = await extractStructuredExamples(senseNode);
       const glossaryNodes = findStructuredNodes(
         senseNode,
         (node) => getStructuredContentMarker(node) === 'glossary',
@@ -1918,9 +1949,12 @@ async function parseStructuredDictionarySenses(rawDefinitions) {
         const values = listItems.length > 0
           ? listItems.map((node) => extractStructuredGlossText(node).trim())
           : [extractStructuredGlossText(glossaryNode).trim()];
-        values.flatMap(splitGlosses).forEach((value) => {
-          if (!glosses.includes(value)) glosses.push(value);
-        });
+        values
+          .map(stripEmbeddedExampleTail)
+          .flatMap(splitGlosses)
+          .forEach((value) => {
+            if (!isKnownExampleText(value, examples) && !glosses.includes(value)) glosses.push(value);
+          });
       }
       if (glosses.length === 0) continue;
 
@@ -1936,8 +1970,6 @@ async function parseStructuredDictionarySenses(rawDefinitions) {
         true
       );
       const notes = Array.from(new Set(noteNodes.map((node) => extractTextFromNode(node).trim()).filter(Boolean))).join(' • ');
-      const examples = await extractStructuredExamples(senseNode);
-
       senses.push({
         index: globalSenseIndex++,
         text: glosses.join('; '),
@@ -2049,6 +2081,7 @@ async function parseDictionarySenses(rawHtml, rawDefinitions = null) {
           defText = defText.replace(prefixKeywords, '').trim();
         }
         defText = defText.replace(/^(?:[•\-\*]|\d+[\.\)]|[①-⑳])\s*/, '').trim();
+        defText = stripEmbeddedExampleTail(defText);
 
         if (defText && !defText.includes('JMdict') && !defText.includes('Tatoeba')) {
           senses.push({
