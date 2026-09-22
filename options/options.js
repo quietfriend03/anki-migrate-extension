@@ -315,7 +315,7 @@ btnFetchModels.addEventListener('click', () => {
   chrome.runtime.sendMessage(
     {
       type: 'LIST_GEMINI_MODELS',
-      payload: { apiKey }
+      payload: { apiKey, forceRefresh: true }
     },
     async (res) => {
       if (isHandled) return;
@@ -384,11 +384,14 @@ btnTestGemini.addEventListener('click', () => {
       }
 
       if (res && res.success) {
-        const { response, usedModel, availableModels } = res.data;
+        const { response, usedModel, requestedModel, usedFallback, availableModels } = res.data;
         if (availableModels && availableModels.length > 0) {
-          updateModelSelectOptions(availableModels, usedModel);
+          updateModelSelectOptions(availableModels, requestedModel || selectedModel);
         }
-        showResult(geminiTestResult, true, `✓ Kết nối Gemini thành công với model "${usedModel}"! AI phản hồi: "${response}"`);
+        const fallbackNotice = usedFallback
+          ? ` Model "${requestedModel || selectedModel}" không dùng được nên lần kiểm tra này đã fallback sang "${usedModel}".`
+          : '';
+        showResult(geminiTestResult, true, `✓ Kết nối Gemini thành công với model "${usedModel}"!${fallbackNotice} AI phản hồi: "${response}"`);
       } else {
         showResult(geminiTestResult, false, `✕ Kết nối thất bại với model "${selectedModel}": ${res?.error || 'Lỗi không xác định'}. Bạn có thể chọn model khác và thử lại.`);
       }

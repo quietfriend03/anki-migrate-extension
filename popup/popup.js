@@ -16,6 +16,40 @@ const dictEmptyBanner = document.getElementById('dict-empty-banner');
 const btnPopupInstallDict = document.getElementById('btn-popup-install-dict');
 
 let autoAiExamples = true;
+let currentAudio = null;
+
+/**
+ * Play audio for a Japanese term using reading (phonetic kana) or term
+ */
+function playAudio(word, reading) {
+  const cleanWord = (word || '').trim();
+  const cleanReading = (reading || cleanWord).trim();
+  if (!cleanWord && !cleanReading) return;
+
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
+
+  const fallbackTts = () => {
+    if ('speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(cleanReading);
+      u.lang = 'ja-JP';
+      window.speechSynthesis.speak(u);
+    }
+  };
+
+  chrome.runtime.sendMessage(
+    { type: 'GET_AUDIO_URL', payload: { word: cleanWord, reading: cleanReading } },
+    (res) => {
+      const audioUrl = res?.data?.audioUrl || `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(cleanReading)}&le=jap`;
+      const audio = new Audio(audioUrl);
+      currentAudio = audio;
+      audio.onerror = fallbackTts;
+      audio.play().catch(fallbackTts);
+    }
+  );
+}
 
 document.addEventListener('DOMContentLoaded', async () => {
   // Open options button
@@ -133,7 +167,7 @@ function renderResults(data) {
       <div class="result-header">
         <div>
           <span class="result-term">${escapeHtml(data.matchedText)}</span>
-          <span class="result-hanviet">${escapeHtml(data.directHanviet.text)}</span>
+          <strong class="result-hanviet">${escapeHtml(formatHanvietDisplay(data.directHanviet.text))}</strong>
         </div>
       </div>
       <p style="color: #64748b; font-size: 11px;">Chưa nạp nghĩa từ vựng này trong từ điển. Bạn có thể mở Options để nạp thêm Jitendex.</p>
@@ -147,20 +181,33 @@ function renderResults(data) {
     card.className = 'result-card';
 
     const hanviet = item.hanviet?.text || '';
+    const displayHanviet = formatHanvietDisplay(hanviet);
     const defs = item.definitions || [];
     const defsHtml = defs
       .slice(0, 3)
-      .map((d) => `<li>${typeof d === 'string' ? escapeHtml(d) : renderStructuredContent(d)}</li>`)
+      .map((d) => {
+        if (typeof d === 'string') return `<li>${escapeHtml(d)}</li>`;
+        const rendered = renderStructuredContent(d);
+        if (/^<(ol|ul|li)/i.test(rendered.trim())) return rendered;
+        return `<li>${rendered}</li>`;
+      })
       .join('');
     const defsPlain = defs
       .map((d) => (typeof d === 'string' ? d : structuredContentToText(d)))
       .filter(Boolean)
       .join('\n');
     const defsHtmlForAnki = defs
-      .map((d) => (typeof d === 'string' ? escapeHtml(d) : renderStructuredContent(d)))
+      .map((def) => {
+        if (typeof def === 'string') return `<li>${escapeHtml(def)}</li>`;
+        const rendered = renderStructuredContent(def);
+        if (/^<(ol|ul|li)/i.test(rendered.trim())) return rendered;
+        if (/<li/i.test(rendered)) return rendered;
+        return `<li>${rendered}</li>`;
+      })
       .filter(Boolean)
-      .join('<br>');
+      .join('');
 
+    const isStructuredDefs = defs.some((d) => typeof d !== 'string');
     const viPos = item.viPos || '';
     const hasExample = Boolean(item.hasExample || (defsHtml && (defsHtml.includes('jlex-sc-example') || defsHtml.includes('Tatoeba'))));
 
@@ -169,7 +216,7 @@ function renderResults(data) {
         <div>
           <span class="result-term">${escapeHtml(item.term)}</span>
           ${item.reading ? `<span class="result-reading">【${escapeHtml(item.reading)}】</span>` : ''}
-          ${hanviet ? `<span class="result-hanviet">[HÁN-VIỆT: ${escapeHtml(hanviet)}]</span>` : ''}
+          ${displayHanviet ? `<strong class="result-hanviet" title="Âm Hán-Việt">${escapeHtml(displayHanviet)}</strong>` : ''}
         </div>
         <button class="icon-btn btn-audio" title="Phát âm">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -181,9 +228,10 @@ function renderResults(data) {
 
       ${viPos ? `<div class="result-pos-badge">${escapeHtml(viPos)}</div>` : ''}
 
-      <ol class="result-defs">
-        ${defsHtml}
-      </ol>
+      ${isStructuredDefs
+        ? `<div class="result-defs result-defs-structured">${defsHtml}</div>`
+        : `<ol class="result-defs">${defsHtml}</ol>`
+      }
 
       ${/[\u4e00-\u9faf\u3400-\u4dbf]/.test(item.term) ? `
       <div class="strokes-toggle-row" style="margin: 6px 0 10px;">
@@ -232,14 +280,7 @@ function renderResults(data) {
 
     // Audio click
     card.querySelector('.btn-audio').onclick = () => {
-      const audioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.term)}&le=jap`;
-      new Audio(audioUrl).play().catch(() => {
-        if ('speechSynthesis' in window) {
-          const u = new SpeechSynthesisUtterance(item.term);
-          u.lang = 'ja-JP';
-          window.speechSynthesis.speak(u);
-        }
-      });
+      playAudio(item.term, item.reading);
     };
 
     // Toggle Kanji Strokes Click
@@ -326,16 +367,18 @@ function renderResults(data) {
               word: item.term,
               reading: item.reading,
               definition: defsPlain,
+              rawDefinitions: item.definitions,
               forceRegenerate: force
             }
           },
           (res) => {
             if (loadingEl) loadingEl.style.display = 'none';
             if (res && res.success && res.data) {
-              const { ex_furigana, ex_vi } = res.data;
+              const { ex_furigana, ex_vi, sense_index } = res.data;
               item.aiExample = {
                 jp: ex_furigana,
-                vi: ex_vi
+                vi: ex_vi,
+                sense_index
               };
               if (jpEl) jpEl.innerHTML = ex_furigana;
               if (viEl) viEl.textContent = ex_vi;
@@ -416,9 +459,10 @@ function renderResults(data) {
             reading: item.reading,
             hanviet: hanviet,
             definition: defsHtmlForAnki || defsPlain,
+            rawDefinitions: item.definitions,
             example: item.aiExample ? item.aiExample.jp : '',
             aiExample: item.aiExample,
-            audioUrl: `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.term)}&le=jap`
+            audioUrl: `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.reading || item.term)}&le=jap`
           }
         },
         (res) => {
@@ -458,6 +502,15 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function formatHanvietDisplay(hanviet) {
+  return String(hanviet || '')
+    .trim()
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .join('-')
+    .toLocaleUpperCase('vi-VN');
 }
 
 const POS_ENGLISH_MAP = {
@@ -557,7 +610,12 @@ function renderStructuredContent(node, insideRuby = false) {
 
     if (node.data && typeof node.data === 'object' && node.data.content === 'partOfSpeech') {
       const posText = formatPosList(node.content);
-      return `<span class="result-pos-badge" style="display:inline-block; margin-right:6px; margin-bottom:4px;">${escapeHtml(posText)}</span>`;
+      return `<span class="jlex-pos-badge" style="display:inline-block; margin-right:6px; margin-bottom:4px;">${escapeHtml(posText)}</span> `;
+    }
+
+    // Skip forms and frequency blocks
+    if (node.data && typeof node.data === 'object' && (node.data.content === 'forms' || node.data.content === 'frequency')) {
+      return '';
     }
 
     const tag = (node.tag || 'span').toLowerCase();

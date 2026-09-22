@@ -153,7 +153,7 @@ Nhấp chuột phải vào biểu tượng tiện ích trên thanh công cụ v�
 2. Nhấn **Create API key** để nhận khóa API miễn phí.
 3. Trong tab **✨ Gemini AI** của Extension:
    - Dán API Key vào ô **Gemini API Key**.
-   - Chọn Model: `gemini-3.6-flash` (khuyên dùng: thế hệ mới nhất, siêu nhanh) hoặc `gemini-1.5-flash`, `gemini-1.5-pro`.
+   - Nhấn **Quét Model** để lấy danh sách model mà API key hiện tại thực sự được cấp quyền, rồi chọn model bạn muốn ưu tiên.
    - Nhấn **Lưu Cấu Hình Gemini** và bấm **Kiểm Tra Kết Nối AI** để xác nhận.
 
 ---

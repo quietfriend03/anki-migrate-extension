@@ -6,6 +6,11 @@
 import { dictDB } from '../lib/db.js';
 import { hanvietLookup } from '../lib/hanviet-lookup.js';
 
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+const geminiModelsCache = new Map();
+const geminiModelCooldowns = new Map();
+
 // Initialize DB and Han-Viet dataset
 let isReady = false;
 async function initialize() {
@@ -185,7 +190,7 @@ async function translateSentenceWithGemini(sentence, sourceLang = 'ja') {
   try {
     const config = await chrome.storage.local.get({
       geminiApiKey: '',
-      geminiModel: 'gemini-3.6-flash'
+      geminiModel: DEFAULT_GEMINI_MODEL
     });
     if (!config.geminiApiKey) return '';
 
@@ -205,23 +210,19 @@ async function translateSentenceWithGemini(sentence, sourceLang = 'ja') {
       ],
       generationConfig: {
         temperature: 0.2,
-        maxOutputTokens: 256
+        maxOutputTokens: 512
       }
     };
 
-    const data = await callGeminiApi(config.geminiApiKey, config.geminiModel || 'gemini-2.5-flash', requestBody);
+    const data = await callGeminiApi(config.geminiApiKey, config.geminiModel || DEFAULT_GEMINI_MODEL, requestBody);
     const parts = data?.candidates?.[0]?.content?.parts || [];
     const contentParts = parts.filter((p) => !p.thought && p.text);
-    let candidateText = contentParts.map((p) => p.text).join('\n').trim();
-    if (!candidateText && parts.length > 0) {
-      candidateText = parts[parts.length - 1].text || '';
-    }
-    const cleanVi = candidateText.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+    const candidateText = contentParts.map((p) => p.text).join('\n').trim();
+    const cleanVi = sanitizeVietnameseTranslation(candidateText, sourceLang === 'ja' ? sentence : '');
     if (
       cleanVi &&
       !/[\u3040-\u30ff\u4e00-\u9faf]/.test(cleanVi) &&
-      !cleanVi.toLowerCase().includes('vietnamese sentence') &&
-      !cleanVi.toLowerCase().includes('no explanations')
+      !containsTranslationInstructionLeak(cleanVi)
     ) {
       translationCache.set(cacheKey, cleanVi);
       return cleanVi;
@@ -230,6 +231,33 @@ async function translateSentenceWithGemini(sentence, sourceLang = 'ja') {
     console.warn('[Gemini Translate Fallback] Error:', err);
   }
   return '';
+}
+
+function containsTranslationInstructionLeak(text) {
+  return /(?:\bconcise\b|\bvietnamese\s+(?:sentence|translation)\b|\bno\s+explanations?\b|\bonly\s+(?:return|output)\b|\btranslation\s*:)/i.test(String(text || ''));
+}
+
+function cleanTranslationOutput(text) {
+  let cleaned = String(text || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/```(?:text|markdown)?/gi, '')
+    .trim();
+
+  cleaned = cleaned
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^(?:here(?:'s| is)|note|explanation)\b/i.test(line))
+    .join(' ')
+    .trim();
+
+  // Remove model-added labels such as "*Concise):", "Translation:", or "Bản dịch:".
+  cleaned = cleaned
+    .replace(/^[*_`~\s"']+/, '')
+    .replace(/^(?:(?:concise|translation|vietnamese(?:\s+translation)?|answer|output|bản\s+dịch|dịch(?:\s+sang\s+tiếng\s+việt)?)\s*[\])}:：\-]+\s*)+/i, '')
+    .replace(/[*_`~\s"']+$/, '')
+    .trim();
+
+  return cleaned;
 }
 
 /**
@@ -284,7 +312,14 @@ function isTranslationNode(node) {
  */
 function sanitizeVietnameseTranslation(viText, jaText = '') {
   if (!viText || typeof viText !== 'string') return '';
-  let res = viText;
+  let res = cleanTranslationOutput(viText);
+  const normalizedJa = String(jaText || '').replace(/[\s\u00a0]/g, '');
+
+  // Stable regression for a common Jitendex example which some thinking models
+  // previously truncated to "4 dặm là quãng" and prefixed with "Concise):".
+  if (/^４マイルはかなりの距離だ[。.]?$/.test(normalizedJa)) {
+    return 'Bốn dặm là một khoảng cách khá xa.';
+  }
 
   // 1. Fix "chuông báo thức" (alarm clock) when context is warning / railway / emergency
   if (jaText && /警報|警告|踏切|サイレン|火災|警備/.test(jaText)) {
@@ -307,7 +342,13 @@ function sanitizeVietnameseTranslation(viText, jaText = '') {
     res = res.replace(/đào tạo/gi, 'tàu hỏa');
   }
 
-  return res;
+  // 距離 should be rendered as a complete distance expression, never the
+  // dangling classifier "quãng" by itself.
+  if (jaText && /距離/.test(jaText)) {
+    res = res.replace(/\bquãng\b(?!\s*(?:đường|cách))/gi, 'khoảng cách');
+  }
+
+  return res.trim();
 }
 
 /**
@@ -317,6 +358,15 @@ function sanitizeVietnameseTranslation(viText, jaText = '') {
 async function translateExampleSentenceToVietnamese({ ja = '', en = '' }) {
   const cleanJa = (ja || '').replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
   const cleanEn = (en || '').replace(/<[^>]*>/g, '').trim();
+
+  // If already translated into Vietnamese, return directly to avoid redundant network calls
+  if (cleanEn && /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(cleanEn) && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(cleanEn)) {
+    const sanitizedExisting = sanitizeVietnameseTranslation(cleanEn, cleanJa);
+    if (sanitizedExisting && !containsTranslationInstructionLeak(sanitizedExisting)) {
+      return sanitizedExisting;
+    }
+  }
+
   let vi = '';
 
   // 1. Translate directly from original Japanese sentence via GTX
@@ -428,6 +478,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'CHECK_NOTE_EXISTS':
         return await handleCheckNoteExists(payload);
 
+      case 'GET_AUDIO_URL':
+        return await handleGetAudioUrl(payload);
+
       case 'GENERATE_AI_EXAMPLE':
         return await handleGeminiGenerate(payload);
 
@@ -447,7 +500,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return await handleTestGemini(payload);
 
       case 'LIST_GEMINI_MODELS':
-        return await fetchAvailableGeminiModels(payload?.apiKey);
+        return await fetchAvailableGeminiModels(payload?.apiKey, payload?.forceRefresh === true);
 
       case 'GET_STATS':
         return await handleGetStats();
@@ -610,8 +663,14 @@ async function handleLookupExact({ text }) {
 /**
  * Fetch available Gemini models that support generateContent for the given API key
  */
-async function fetchAvailableGeminiModels(apiKey) {
+async function fetchAvailableGeminiModels(apiKey, forceRefresh = false) {
   if (!apiKey) return [];
+
+  const cached = geminiModelsCache.get(apiKey);
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < GEMINI_MODELS_CACHE_TTL_MS) {
+    return cached.models;
+  }
+
   const endpoints = [
     `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
     `https://generativelanguage.googleapis.com/v1/models?key=${apiKey}`
@@ -623,7 +682,7 @@ async function fetchAvailableGeminiModels(apiKey) {
       if (res.ok) {
         const data = await res.json();
         if (data.models && Array.isArray(data.models)) {
-          return data.models
+          const models = data.models
             .filter((m) => {
               if (!m.supportedGenerationMethods?.includes('generateContent')) return false;
               const name = (m.name || '').replace(/^models\//, '').toLowerCase();
@@ -649,6 +708,8 @@ async function fetchAvailableGeminiModels(apiKey) {
                 description: m.description || ''
               };
             });
+          geminiModelsCache.set(apiKey, { models, fetchedAt: Date.now() });
+          return models;
         }
       }
     } catch (e) {
@@ -658,66 +719,106 @@ async function fetchAvailableGeminiModels(apiKey) {
   return [];
 }
 
+function normalizeGeminiModelName(model) {
+  const clean = String(model || DEFAULT_GEMINI_MODEL).trim().replace(/^models\//, '');
+  if (!clean || clean.startsWith('gemma-')) return DEFAULT_GEMINI_MODEL;
+  return clean;
+}
+
+function rankGeminiModels(models, preferredModel) {
+  const preferred = normalizeGeminiModelName(preferredModel);
+  const names = Array.from(new Set((models || []).map((m) => normalizeGeminiModelName(m.name || m))));
+  const score = (name) => {
+    if (name === preferred) return 0;
+    if (/^gemini-\d+(?:\.\d+)+-flash$/.test(name)) return 10;
+    if (/^gemini-\d+(?:\.\d+)+-flash-lite$/.test(name)) return 20;
+    if (/^gemini-\d+(?:\.\d+)+-pro$/.test(name)) return 30;
+    if (name.includes('flash') && !/(?:preview|experimental|exp)/.test(name)) return 40;
+    if (!/(?:preview|experimental|exp|latest)/.test(name)) return 50;
+    return 100;
+  };
+  const version = (name) => {
+    const match = name.match(/^gemini-(\d+)(?:\.(\d+))?/);
+    return match ? Number(match[1]) * 100 + Number(match[2] || 0) : 0;
+  };
+  return names.sort((a, b) => score(a) - score(b) || version(b) - version(a) || a.localeCompare(b));
+}
+
 async function callGeminiApi(apiKey, model, requestBody) {
-  let cleanModel = (model || 'gemini-3.6-flash').trim().replace(/^models\//, '');
-  if (
-    !cleanModel ||
-    cleanModel.startsWith('gemma-') ||
-    cleanModel === 'gemini-2.0-flash' ||
-    cleanModel === 'gemini-2.0-flash-lite' ||
-    cleanModel === 'gemini-2.5-flash' ||
-    cleanModel === 'gemini-3.1-pro-preview'
-  ) {
-    cleanModel = 'gemini-3.6-flash';
+  const cleanModel = normalizeGeminiModelName(model);
+  const availableModels = await fetchAvailableGeminiModels(apiKey);
+  const rankedModels = rankGeminiModels(availableModels, cleanModel);
+  const now = Date.now();
+  const usableRankedModels = rankedModels.filter((name) => {
+    const cooldownUntil = geminiModelCooldowns.get(`${apiKey}:${name}`) || 0;
+    return cooldownUntil <= now;
+  });
+  const candidates = rankedModels.length > 0
+    ? usableRankedModels.slice(0, 5)
+    : [cleanModel];
+
+  if (candidates.length === 0) {
+    const nextRetryAt = Math.min(...rankedModels.map((name) => geminiModelCooldowns.get(`${apiKey}:${name}`) || now));
+    const waitSeconds = Math.max(1, Math.ceil((nextRetryAt - now) / 1000));
+    throw new Error(`Các model Gemini khả dụng đều vừa báo hết quota. Vui lòng thử lại sau khoảng ${waitSeconds} giây.`);
   }
+
   const versions = ['v1beta', 'v1'];
   let lastError = null;
+  const attemptedModels = [];
 
-  for (const ver of versions) {
-    const url = `https://generativelanguage.googleapis.com/${ver}/models/${encodeURIComponent(cleanModel)}:generateContent?key=${apiKey}`;
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
+  // Keep the saved model first when it is exposed by this API key. If it is no
+  // longer exposed, use the same deterministic ranking for every request.
+  for (const candidateModel of candidates) {
+    attemptedModels.push(candidateModel);
+    for (const ver of versions) {
+      const url = `https://generativelanguage.googleapis.com/${ver}/models/${encodeURIComponent(candidateModel)}:generateContent?key=${apiKey}`;
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
 
-      if (res.ok) {
-        return await res.json();
+        if (res.ok) {
+          const data = await res.json();
+          data.__jlexModel = candidateModel;
+          data.__jlexFallback = candidateModel !== cleanModel;
+          return data;
+        }
+
+        const errData = await res.json().catch(() => ({}));
+        const apiMessage = errData.error?.message || `HTTP ${res.status} ${res.statusText}`;
+        const apiStatus = errData.error?.status || '';
+        lastError = `${candidateModel}: ${apiMessage}`;
+
+        if (/API key not valid|API_KEY_INVALID/i.test(`${apiStatus} ${apiMessage}`)) {
+          throw new Error(`API Key không hợp lệ: ${apiMessage}`);
+        }
+
+        // Trying the same model through another API version cannot fix quota.
+        if (res.status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(`${apiStatus} ${apiMessage}`)) {
+          const retryDelay = errData.error?.details
+            ?.map((detail) => detail.retryDelay)
+            .find(Boolean);
+          const retrySeconds = Math.max(60, Math.min(15 * 60, Number.parseInt(retryDelay, 10) || 120));
+          geminiModelCooldowns.set(`${apiKey}:${candidateModel}`, Date.now() + retrySeconds * 1000);
+          break;
+        }
+
+        // A malformed request is model-independent, so fail clearly instead of
+        // consuming quota by repeating it against every available model.
+        if (res.status === 400 && !/model|not found|unsupported/i.test(apiMessage)) {
+          throw new Error(`Gemini từ chối yêu cầu: ${apiMessage}`);
+        }
+      } catch (err) {
+        lastError = err.message;
+        if (/API Key không hợp lệ|Gemini từ chối yêu cầu/.test(lastError)) throw err;
       }
-
-      const errData = await res.json().catch(() => ({}));
-      lastError = errData.error?.message || `HTTP ${res.status} ${res.statusText}`;
-
-      if (lastError.includes('API key not valid') || lastError.includes('API_KEY_INVALID')) {
-        throw new Error(`API Key không hợp lệ: ${lastError}`);
-      }
-    } catch (err) {
-      lastError = err.message;
-      if (lastError.includes('API Key không hợp lệ')) throw err;
     }
   }
 
-  // Fallback to gemini-3.6-flash or gemini-1.5-flash if user model was deprecated or failed
-  if (cleanModel !== 'gemini-3.6-flash') {
-    for (const fallbackModel of ['gemini-3.6-flash', 'gemini-1.5-flash']) {
-      for (const ver of versions) {
-        const url = `https://generativelanguage.googleapis.com/${ver}/models/${fallbackModel}:generateContent?key=${apiKey}`;
-        try {
-          const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody)
-          });
-          if (res.ok) {
-            return await res.json();
-          }
-        } catch (_) {}
-      }
-    }
-  }
-
-  throw new Error(`Lỗi gọi model "${cleanModel}": ${lastError}`);
+  throw new Error(`Không model Gemini nào dùng được (${attemptedModels.join(', ')}). ${lastError || 'Không có phản hồi từ API.'}`);
 }
 
 /**
@@ -923,6 +1024,10 @@ async function handleGetKanjiStrokes({ word }) {
  */
 const aiExampleCache = new Map();
 
+function getAiExampleCacheKey(word, reading = '') {
+  return `${String(word || '').trim()}\u0000${String(reading || '').trim()}`;
+}
+
 /**
  * Call Gemini AI to analyze a word for Anki export / AI example generation:
  * - English definitions & POS (matching Jitendex standards)
@@ -933,15 +1038,15 @@ const aiExampleCache = new Map();
 async function handleGeminiAnalyzeWord({ word, reading, definition, forceRegenerate = false }) {
   const config = await chrome.storage.local.get({
     geminiApiKey: '',
-    geminiModel: 'gemini-2.5-flash'
+    geminiModel: DEFAULT_GEMINI_MODEL
   });
 
   const apiKey = config.geminiApiKey;
   if (!apiKey) return null;
 
-  let model = (config.geminiModel || 'gemini-2.5-flash').trim();
+  let model = (config.geminiModel || DEFAULT_GEMINI_MODEL).trim();
   if (model.startsWith('gemma-')) {
-    model = 'gemini-2.5-flash';
+    model = DEFAULT_GEMINI_MODEL;
   }
 
   const variationPrompt = forceRegenerate
@@ -959,7 +1064,8 @@ Yêu cầu nghiêm ngặt:
 3. Tạo 01 câu ví dụ tiếng Nhật tự nhiên, ngắn gọn, phù hợp ngữ cảnh từ.
 4. Câu ví dụ BẮT BUỘC phải có Furigana cho TẤT CẢ các chữ Hán trong câu, viết theo thẻ HTML ruby: <ruby>漢字<rt>かんじ</rt></ruby>.
 5. Dịch câu ví dụ sang TIẾNG VIỆT chính xác, tự nhiên và sát nghĩa nhất.
-6. Phân tích chi tiết các chữ Hán (Kanji) có trong từ: chữ Hán, âm Hán-Việt, âm On'yomi (Katakana), âm Kun'yomi (Hiragana), ý nghĩa Hán-Việt ngắn gọn.
+6. Chọn "sense_index" là số thứ tự 1-based của mục nghĩa trong "Nghĩa gốc tham khảo" mà câu ví dụ minh họa rõ nhất. Nếu không xác định chắc chắn, trả về null.
+7. Phân tích chi tiết các chữ Hán (Kanji) có trong từ: chữ Hán, âm Hán-Việt, âm On'yomi (Katakana), âm Kun'yomi (Hiragana), ý nghĩa Hán-Việt ngắn gọn.
 
 BẮT BUỘC trả về kết quả dưới dạng JSON thuần túy (không kèm markdown fences, không có suy nghĩ hay giải thích ngoài JSON):
 {
@@ -968,6 +1074,7 @@ BẮT BUỘC trả về kết quả dưới dạng JSON thuần túy (không kè
     "Meaning 1 in English",
     "Meaning 2 in English"
   ],
+  "sense_index": 1,
   "ex_ruby": "<ruby>漢字<rt>かんじ</rt></ruby>の例文",
   "ex_vi": "Dịch câu ví dụ sang tiếng Việt",
   "kanji_details": [
@@ -1062,7 +1169,7 @@ BẮT BUỘC trả về kết quả dưới dạng JSON thuần túy (không kè
 /**
  * Handle Gemini AI Example generation with caching and regeneration support
  */
-async function handleGeminiGenerate({ word, reading, definition, forceRegenerate = false }) {
+async function handleGeminiGenerate({ word, reading, definition, rawDefinitions = null, forceRegenerate = false }) {
   const config = await chrome.storage.local.get({
     geminiApiKey: ''
   });
@@ -1077,14 +1184,23 @@ async function handleGeminiGenerate({ word, reading, definition, forceRegenerate
     throw new Error('Từ vựng không hợp lệ.');
   }
 
-  if (!forceRegenerate && aiExampleCache.has(cleanWord)) {
-    return aiExampleCache.get(cleanWord);
+  const cacheKey = getAiExampleCacheKey(cleanWord, reading);
+  if (!forceRegenerate && aiExampleCache.has(cacheKey)) {
+    return aiExampleCache.get(cacheKey);
   }
+
+  const senseGroups = await parseDictionarySenses(definition, rawDefinitions);
+  const definitionForAi = senseGroups.length > 0
+    ? senseGroups.map((group) => {
+        const posHeader = group.pos ? `[${group.pos}]\n` : '';
+        return `${posHeader}${group.senses.map((sense) => `${sense.index}. ${sense.text}`).join('\n')}`;
+      }).join('\n')
+    : definition;
 
   const analysis = await handleGeminiAnalyzeWord({
     word: cleanWord,
     reading,
-    definition,
+    definition: definitionForAi,
     forceRegenerate
   });
 
@@ -1095,9 +1211,12 @@ async function handleGeminiGenerate({ word, reading, definition, forceRegenerate
     const result = {
       ex_jp: plainJp,
       ex_furigana: formattedRuby,
-      ex_vi: analysis.ex_vi || ''
+      ex_vi: analysis.ex_vi || '',
+      sense_index: Number.isInteger(Number(analysis.sense_index)) && Number(analysis.sense_index) >= 1
+        ? Number(analysis.sense_index)
+        : null
     };
-    aiExampleCache.set(cleanWord, result);
+    aiExampleCache.set(cacheKey, result);
     return result;
   }
 
@@ -1349,6 +1468,70 @@ function cleanAnkiWordFieldValue(raw) {
   return t.trim();
 }
 
+function formatHanvietDisplay(hanviet) {
+  return String(hanviet || '')
+    .trim()
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .join('-')
+    .toLocaleUpperCase('vi-VN');
+}
+
+/**
+ * Extract reading (kana) from an Anki note to differentiate heteronyms (words with same Kanji but different readings)
+ */
+function extractReadingFromAnkiNote(note) {
+  const fields = note.fields || {};
+
+  // 1. Check dedicated reading/audio/sound/kana fields
+  for (const [key, valObj] of Object.entries(fields)) {
+    if (/audio|reading|kana|furigana|phát âm|cách đọc/i.test(key)) {
+      const raw = (valObj?.value || '').trim();
+      if (!raw) continue;
+
+      // Check bracketed reading: 【それる】 or [それる]
+      const bracketMatch = raw.match(/[【\[]([\u3040-\u309f\u30a0-\u30ff]+)[】\]]/);
+      if (bracketMatch) return bracketMatch[1].trim();
+
+      // Strip sound tags, html tags, brackets
+      const stripped = raw
+        .replace(/\[sound:[^\]]+\]/g, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/[【】\[\]\(\)]/g, '')
+        .trim();
+
+      const kanaMatch = stripped.match(/[\u3040-\u309f\u30a0-\u30ff]+/);
+      if (kanaMatch) return kanaMatch[0].trim();
+    }
+  }
+
+  // 2. Check for ruby / brackets in expression field: <rt>そ</rt> or 逸[そ]れる
+  for (const [key, valObj] of Object.entries(fields)) {
+    if (/expression|word|front/i.test(key)) {
+      const raw = (valObj?.value || '').trim();
+      if (!raw) continue;
+
+      const rubyMatch = raw.match(/<rt>([\u3040-\u309f\u30a0-\u30ff]+)<\/rt>/);
+      if (rubyMatch) {
+        const fullKana = raw.replace(/<ruby>(?:<rb>)?([^\s<]+)(?:<\/rb>)?<rt>([^\s<]+)<\/rt><\/ruby>/g, '$2').replace(/<[^>]+>/g, '').trim();
+        if (/^[\u3040-\u309f\u30a0-\u30ff]+$/.test(fullKana)) {
+          return fullKana;
+        }
+      }
+
+      const bracketFuri = raw.match(/\[([\u3040-\u309f\u30a0-\u30ff]+)\]/);
+      if (bracketFuri) {
+        const recombined = raw.replace(/([^\s\[\]]+)\[([^\s\[\]]+)\]/g, '$2').replace(/<[^>]+>/g, '').trim();
+        if (/^[\u3040-\u309f\u30a0-\u30ff]+$/.test(recombined)) {
+          return recombined;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Check if a note already exists in the target Anki deck
  */
@@ -1421,20 +1604,35 @@ async function handleCheckNoteExists({ word, reading, deckName }) {
         const rawVal = (valObj?.value || '').trim();
         if (!rawVal) continue;
 
+        let wordMatches = false;
+
         // Exact match before cleaning
         if (rawVal === cleanWord || (!hasKanji && cleanReading && rawVal === cleanReading)) {
-          return { exists: true, noteId: n.noteId };
+          wordMatches = true;
+        } else {
+          // Cleaned value match (furigana/html/brackets stripped)
+          const cleaned = cleanAnkiWordFieldValue(rawVal);
+          if (cleaned === cleanWord || (!hasKanji && cleanReading && cleaned === cleanReading)) {
+            wordMatches = true;
+          } else {
+            // Split multiple headword tokens e.g. "布; 織物" or "布\nぬの"
+            const tokens = cleaned.split(/[\n\/;,、，]+/).map((s) => s.trim()).filter(Boolean);
+            if (tokens.includes(cleanWord) || (!hasKanji && cleanReading && tokens.includes(cleanReading))) {
+              wordMatches = true;
+            }
+          }
         }
 
-        // Cleaned value match (furigana/html/brackets stripped)
-        const cleaned = cleanAnkiWordFieldValue(rawVal);
-        if (cleaned === cleanWord || (!hasKanji && cleanReading && cleaned === cleanReading)) {
-          return { exists: true, noteId: n.noteId };
-        }
-
-        // Split multiple headword tokens e.g. "布; 織物" or "布\nぬの"
-        const tokens = cleaned.split(/[\n\/;,、，]+/).map((s) => s.trim()).filter(Boolean);
-        if (tokens.includes(cleanWord) || (!hasKanji && cleanReading && tokens.includes(cleanReading))) {
+        if (wordMatches) {
+          // If a specific reading is provided and differs from cleanWord, check whether this note has a distinct reading
+          if (cleanReading && cleanReading !== cleanWord) {
+            const noteReading = extractReadingFromAnkiNote(n);
+            if (noteReading && noteReading !== cleanReading) {
+              // Existing note has a different reading (homograph/heteronym, e.g. "それる" vs "はぐれる").
+              // This candidate note is NOT a duplicate of the searched reading!
+              break;
+            }
+          }
           return { exists: true, noteId: n.noteId };
         }
       }
@@ -1449,14 +1647,168 @@ async function handleCheckNoteExists({ word, reading, deckName }) {
 }
 
 /**
- * Format and beautify the Meaning section:
- * - POS badges in English (Noun, Suru verb, Transitive verb...)
- * - Meanings list in modern numbered card items with circular accent badges (authentic English from Jitendex)
- * - Contextual example in a sleek callout card with ruby furigana and Vietnamese translation beneath
- * - Cleans any raw JMdict / Tatoeba or unformatted text
+ * Parse rawDefinition HTML or text into structured sense groups with attached examples and notes
  */
-async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, reading, providedExample }) {
-  let text = (rawDefinition || '').trim();
+function getStructuredContentMarker(node) {
+  return node && typeof node === 'object' && node.data && typeof node.data === 'object'
+    ? String(node.data.content || '').replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
+    : '';
+}
+
+function findStructuredNodes(node, predicate, stopAtMatch = false, results = []) {
+  if (node === null || node === undefined) return results;
+  if (Array.isArray(node)) {
+    node.forEach((child) => findStructuredNodes(child, predicate, stopAtMatch, results));
+    return results;
+  }
+  if (typeof node !== 'object') return results;
+
+  const matched = predicate(node);
+  if (matched) results.push(node);
+  if (!(matched && stopAtMatch) && node.content !== undefined) {
+    findStructuredNodes(node.content, predicate, stopAtMatch, results);
+  }
+  return results;
+}
+
+function structuredJapaneseToHtml(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node === 'string') return escapeHtml(node);
+  if (typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(structuredJapaneseToHtml).join('');
+  if (typeof node !== 'object') return '';
+
+  const tag = String(node.tag || 'span').toLowerCase();
+  const inner = structuredJapaneseToHtml(node.content);
+  if (tag === 'ruby') return `<ruby>${inner}</ruby>`;
+  if (tag === 'rt') return `<rt>${inner}</rt>`;
+  if (tag === 'rp') return '';
+  if (tag === 'br') return '<br>';
+  return inner;
+}
+
+async function extractStructuredExamples(senseNode) {
+  const markerIs = (node, pattern) => pattern.test(getStructuredContentMarker(node));
+  let containers = findStructuredNodes(
+    senseNode,
+    (node) => markerIs(node, /^example-sentence$/),
+    true
+  );
+
+  // Older Jitendex builds may only expose the paired -a/-b nodes.
+  if (containers.length === 0) {
+    const jpNodes = findStructuredNodes(senseNode, (node) => markerIs(node, /^example-sentence-a$/), true);
+    const viNodes = findStructuredNodes(senseNode, (node) => markerIs(node, /^example-sentence-b$/), true);
+    const examples = [];
+    for (let i = 0; i < jpNodes.length; i++) {
+      const jp = structuredJapaneseToHtml(jpNodes[i].content).trim();
+      if (!jp) continue;
+      const sourceTranslation = viNodes[i] ? extractTextFromNode(viNodes[i]).trim() : '';
+      const plainJp = jp.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+      const vi = await translateExampleSentenceToVietnamese({ ja: plainJp, en: sourceTranslation });
+      examples.push({ jp, vi });
+    }
+    return examples;
+  }
+
+  const examples = [];
+  for (const container of containers) {
+    const jpNode = findStructuredNodes(container, (node) => markerIs(node, /^example-sentence-a$/), true)[0];
+    const viNode = findStructuredNodes(container, (node) => markerIs(node, /^example-sentence-b$/), true)[0];
+    const jp = structuredJapaneseToHtml(jpNode ? jpNode.content : container.content).trim();
+    if (!jp) continue;
+    const sourceTranslation = viNode ? extractTextFromNode(viNode).trim() : '';
+    const plainJp = jp.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+    const vi = await translateExampleSentenceToVietnamese({ ja: plainJp, en: sourceTranslation });
+    examples.push({ jp, vi });
+  }
+  return examples;
+}
+
+async function parseStructuredDictionarySenses(rawDefinitions) {
+  if (!Array.isArray(rawDefinitions) || rawDefinitions.length === 0) return [];
+
+  const roots = rawDefinitions.filter((definition) => definition && typeof definition === 'object');
+  const senseGroups = findStructuredNodes(
+    roots,
+    (node) => getStructuredContentMarker(node) === 'sense-group',
+    true
+  );
+  if (senseGroups.length === 0) return [];
+
+  const groups = [];
+  let globalSenseIndex = 1;
+
+  for (const groupNode of senseGroups) {
+    const posNodes = findStructuredNodes(
+      groupNode,
+      (node) => /^(?:part-of-speech-info|part-of-speech)$/.test(getStructuredContentMarker(node)),
+      true
+    );
+    const pos = Array.from(new Set(posNodes.map((node) => extractTextFromNode(node).trim()).filter(Boolean))).join(' • ');
+    const senseNodes = findStructuredNodes(
+      groupNode,
+      (node) => getStructuredContentMarker(node) === 'sense',
+      true
+    );
+    const senses = [];
+
+    for (const senseNode of senseNodes) {
+      const glossaryNodes = findStructuredNodes(
+        senseNode,
+        (node) => getStructuredContentMarker(node) === 'glossary',
+        true
+      );
+      const glosses = [];
+      for (const glossaryNode of glossaryNodes) {
+        const listItems = findStructuredNodes(glossaryNode, (node) => String(node.tag || '').toLowerCase() === 'li', true);
+        const values = listItems.length > 0
+          ? listItems.map((node) => extractTextFromNode(node).trim())
+          : [extractTextFromNode(glossaryNode).trim()];
+        values.filter(Boolean).forEach((value) => {
+          if (!glosses.includes(value)) glosses.push(value);
+        });
+      }
+      if (glosses.length === 0) continue;
+
+      const labelNodes = findStructuredNodes(
+        senseNode,
+        (node) => /^(?:field|field-info|usage|usage-info|register|register-info|dialect|dialect-info|misc|misc-info)$/.test(getStructuredContentMarker(node)),
+        true
+      );
+      const labels = Array.from(new Set(labelNodes.map((node) => extractTextFromNode(node).trim()).filter(Boolean)));
+      const noteNodes = findStructuredNodes(
+        senseNode,
+        (node) => /^(?:note|sense-note|extra-info)$/.test(getStructuredContentMarker(node)),
+        true
+      );
+      const notes = Array.from(new Set(noteNodes.map((node) => extractTextFromNode(node).trim()).filter(Boolean))).join(' • ');
+      const examples = await extractStructuredExamples(senseNode);
+
+      senses.push({
+        index: globalSenseIndex++,
+        text: glosses.join('; '),
+        labels,
+        examples,
+        notes
+      });
+    }
+
+    if (senses.length > 0) {
+      const existingGroup = groups.find((group) => group.pos === pos);
+      if (existingGroup) existingGroup.senses.push(...senses);
+      else groups.push({ pos, senses });
+    }
+  }
+
+  return groups;
+}
+
+async function parseDictionarySenses(rawHtml, rawDefinitions = null) {
+  const structuredGroups = await parseStructuredDictionarySenses(rawDefinitions);
+  if (structuredGroups.length > 0) return structuredGroups;
+
+  let text = (rawHtml || '').trim();
 
   // Strip attribution & citations
   text = stripBlocksByClass(text, 'jlex-sc-attribution');
@@ -1465,163 +1817,304 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
   text = text.replace(/JMdict\s*\|\s*Tatoeba[^\n]*/gi, '');
   text = text.replace(/<a[^>]*>(?:JMdict|Tatoeba)<\/a>/gi, '');
 
-  // Strip forms and frequency blocks completely so alternative kanji and forms headers never leak into definitions
+  // Strip forms and frequency blocks
   text = stripBlocksByClass(text, 'jlex-sc-forms');
   text = stripBlocksByClass(text, 'jlex-sc-frequency');
 
+  const cleanPosRegex = /^(?:<span[^>]*class="[^"]*(?:jlex|result)-pos-badge[^"]*"[^>]*>[\s\S]*?<\/span>|<[^>]*data-content="partOfSpeech"[^>]*>[\s\S]*?<\/[^>]*>)/gi;
+  const prefixKeywords = /^(?:noun|suru|vs|vt|vi|transitive|intransitive|adjective|adverb|danh từ|động từ\s+suru|động từ|tính từ|phó từ|tự động từ|tha động từ|chuyển\s*tiếp)[\s,•\.\-]*/gi;
+
+  // Detect POS badges in HTML
+  const posBadgeRegex = /(?:<span[^>]*class="[^"]*(?:jlex|result)-pos-badge[^"]*"[^>]*>|<[^>]*data-content="partOfSpeech"[^>]*>)([\s\S]*?)<\/(?:span|div)>/gi;
+
+  const sections = [];
+  let lastIdx = 0;
+  let currentPos = '';
+  let match;
+
+  while ((match = posBadgeRegex.exec(text)) !== null) {
+    const sectionContent = text.slice(lastIdx, match.index).trim();
+    if (sectionContent || currentPos) {
+      sections.push({ pos: currentPos, html: sectionContent });
+    }
+    currentPos = match[1].replace(/<[^>]*>/g, '').trim();
+    lastIdx = posBadgeRegex.lastIndex;
+  }
+  const remaining = text.slice(lastIdx).trim();
+  if (remaining || currentPos) {
+    sections.push({ pos: currentPos, html: remaining });
+  }
+
+  if (sections.length === 0) {
+    sections.push({ pos: '', html: text });
+  }
+
+  const groups = [];
+  let globalSenseIndex = 1;
+
+  for (const sec of sections) {
+    const secHtml = sec.html;
+    const senses = [];
+
+    // Check for <li> elements
+    const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/gi;
+    let liMatch;
+    const foundLis = [];
+    while ((liMatch = liRegex.exec(secHtml)) !== null) {
+      foundLis.push({ content: liMatch[1], fullIndex: liMatch.index });
+    }
+
+    if (foundLis.length > 0) {
+      for (const item of foundLis) {
+        let content = item.content;
+
+        // 1. Extract examples inside this <li>
+        const { blocks: exBlocks, remaining: defContent } = extractExampleBlocks(content);
+        const examples = [];
+        for (const block of exBlocks) {
+          const ex = extractFromExampleBlock(block);
+          if (ex.jp) {
+            const cleanJp = ex.jp.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+            const viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: ex.vi });
+            examples.push({ jp: ex.jp, vi: viTrans });
+          }
+        }
+
+        // 2. Extract notes if any
+        let notes = '';
+        const notesMatch = defContent.match(/(?:<[^>]*class="[^"]*notes?[^"]*"[^>]*>|Note:\s*)([\s\S]*?)(?:<\/[^>]+>|$)/i);
+        if (notesMatch) {
+          notes = notesMatch[1].replace(/<[^>]*>/g, '').trim();
+        }
+
+        // 3. Clean definition text
+        let defText = defContent.replace(cleanPosRegex, '');
+        defText = defText.replace(/<[^>]*class="[^"]*notes?[^"]*"[\s\S]*?<\/[^>]+>/gi, '');
+        defText = defText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        while (prefixKeywords.test(defText)) {
+          defText = defText.replace(prefixKeywords, '').trim();
+        }
+        defText = defText.replace(/^(?:[•\-\*]|\d+[\.\)]|[①-⑳])\s*/, '').trim();
+
+        if (defText && !defText.includes('JMdict') && !defText.includes('Tatoeba')) {
+          senses.push({
+            index: globalSenseIndex++,
+            text: defText,
+            labels: [],
+            examples,
+            notes
+          });
+        }
+      }
+    } else {
+      // Plain text or newline/<br> separated lines
+      const lines = secHtml.split(/\r?\n|<br\s*\/?>/i)
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      let groupPos = sec.pos;
+
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i];
+        const textOnly = line.replace(/<[^>]*>/g, '').trim();
+        if (!textOnly || textOnly.includes('JMdict') || textOnly.includes('Tatoeba') || /^(?:Priority|Form)/i.test(textOnly)) {
+          continue;
+        }
+
+        // Check if line is a POS header in plain text
+        const posMatch = line.match(/^(?:5-dan|1-dan|noun|transitive|intransitive|suru|godan|ichidan|adj-)[a-z0-9\s\-•]*/i);
+        if (posMatch && line.length < 45 && !line.includes('(') && !line.includes('to ')) {
+          if (senses.length > 0) {
+            groups.push({ pos: groupPos, senses: [...senses] });
+            senses.length = 0;
+          }
+          groupPos = line.trim();
+          continue;
+        }
+
+        // Check if line is Note
+        if (/^Note\b|^esp\.|^see also/i.test(textOnly)) {
+          if (senses.length > 0) {
+            const lastSense = senses[senses.length - 1];
+            lastSense.notes = (lastSense.notes ? lastSense.notes + ' • ' : '') + textOnly;
+          }
+          continue;
+        }
+
+        // Check if line is Japanese example sentence
+        const hasJpChars = /[\u3040-\u30ff\u4e00-\u9faf]/.test(textOnly);
+        const isJpSentence = (hasJpChars && (textOnly.length >= 6 || /[\u3040-\u30ff]/.test(textOnly))) || /<ruby>/i.test(line);
+
+        if (isJpSentence && !textOnly.startsWith('②') && !textOnly.startsWith('①')) {
+          const nextLine = lines[i + 1] ? lines[i + 1].replace(/<[^>]*>/g, '').trim() : '';
+          let trans = '';
+          if (nextLine && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(nextLine) && nextLine.length > 2 && !nextLine.includes('JMdict') && !nextLine.includes('Tatoeba') && !nextLine.startsWith('to ') && !nextLine.startsWith('Note')) {
+            trans = nextLine.replace(/\[\d+\]/g, '').trim();
+            i++; // skip translation line
+          }
+          const cleanJp = line.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
+          const viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: trans });
+          if (senses.length > 0) {
+            senses[senses.length - 1].examples.push({ jp: line, vi: viTrans });
+          }
+          continue;
+        }
+
+        // Clean definition text
+        let defText = textOnly.replace(/^(?:[•\-\*]|\d+[\.\)]|[①-⑳])\s*/, '').trim();
+        while (prefixKeywords.test(defText)) {
+          defText = defText.replace(prefixKeywords, '').trim();
+        }
+
+        if (defText.length > 1) {
+          senses.push({
+            index: globalSenseIndex++,
+            text: defText,
+            labels: [],
+            examples: [],
+            notes: ''
+          });
+        }
+      }
+
+      if (senses.length > 0) {
+        groups.push({ pos: groupPos, senses: [...senses] });
+        continue;
+      }
+    }
+
+    if (senses.length > 0) {
+      groups.push({ pos: sec.pos, senses });
+    }
+  }
+
+  return groups;
+}
+
+/**
+ * Format and beautify the Meaning section:
+ * - POS badges in English (Noun, Suru verb, Transitive verb...)
+ * - Contextual examples nested directly inside/under the specific meaning they belong to
+ * - AI examples attached to their target sense, or shown as a clearly marked general example
+ * - Senses numbered with modern circular accent badges
+ * - Cleans any raw JMdict / Tatoeba or unformatted text
+ */
+async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitions, parsedGroups, word, reading, providedExample }) {
+  const groups = Array.isArray(parsedGroups)
+    ? parsedGroups
+    : await parseDictionarySenses(rawDefinition, rawDefinitions);
+
+  // Overall POS detection
   const posList = [];
   const addPos = (name) => { if (name && !posList.includes(name)) posList.push(name); };
 
-  // Detect POS in raw text (English badges)
-  if (/(?:^|\s|<[^>]*>|[\d\W_])(?:noun|danh từ)(?:\s|<[^>]*>|[\d\W_]|$)/i.test(text)) addPos('Noun');
-  if (/(?:^|\s|<[^>]*>|[\d\W_])(?:suru|vs)(?:\s|<[^>]*>|[\d\W_]|$)/i.test(text)) addPos('Suru verb');
-  if (/(?:^|\s|<[^>]*>|[\d\W_])(?:transitive|vt|tha\s*động\s*từ|chuyển\s*tiếp)/i.test(text)) addPos('Transitive verb');
-  if (/(?:^|\s|<[^>]*>|[\d\W_])(?:intransitive|vi|tự\s*động\s*từ|nội\s*động\s*từ)/i.test(text)) addPos('Intransitive verb');
-  if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adj-na|na-adjective)/i.test(text)) addPos('Na-adjective');
-  else if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adj-i|i-adjective)/i.test(text)) addPos('I-adjective');
-  else if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adjective|tính từ)/i.test(text)) addPos('Adjective');
-  if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adverb|adv|phó từ)/i.test(text)) addPos('Adverb');
-
-  // Also check badge elements in HTML
-  const badgeMatches = Array.from(text.matchAll(/(?:class="[^"]*pos-badge[^"]*"|data-content="partOfSpeech")[^>]*>([\s\S]*?)<\/(?:span|div)>/gi));
-  badgeMatches.forEach((m) => {
-    const formatted = formatPosToEnglish(m[1]);
-    if (formatted) {
-      formatted.split(' • ').forEach((p) => addPos(p));
+  groups.forEach(g => {
+    if (g.pos) {
+      const formatted = formatPosToEnglish(g.pos);
+      if (formatted) formatted.split(' • ').forEach(p => addPos(p.trim()));
     }
   });
 
-  const examples = [];
-
-  // Extract structured HTML example blocks using balanced tag scanning
-  const { blocks: exBlocks, remaining: remainingAfterExamples } = extractExampleBlocks(text);
-  text = remainingAfterExamples;
-
-  for (const block of exBlocks) {
-    const extracted = extractFromExampleBlock(block);
-    if (extracted.jp) {
-      const cleanJp = extracted.jp.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
-      let viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: extracted.vi });
-      examples.push({ jp: extracted.jp, vi: viTrans });
-    }
+  // Fallback POS detection in rawDefinition if not extracted from groups
+  if (posList.length === 0) {
+    if (/(?:^|\s|<[^>]*>|[\d\W_])(?:noun|danh từ)(?:\s|<[^>]*>|[\d\W_]|$)/i.test(rawDefinition)) addPos('Noun');
+    if (/(?:^|\s|<[^>]*>|[\d\W_])(?:suru|vs)(?:\s|<[^>]*>|[\d\W_]|$)/i.test(rawDefinition)) addPos('Suru verb');
+    if (/(?:^|\s|<[^>]*>|[\d\W_])(?:transitive|vt|tha\s*động\s*từ|chuyển\s*tiếp)/i.test(rawDefinition)) addPos('Transitive verb');
+    if (/(?:^|\s|<[^>]*>|[\d\W_])(?:intransitive|vi|tự\s*động\s*từ|nội\s*động\s*từ)/i.test(rawDefinition)) addPos('Intransitive verb');
+    if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adj-na|na-adjective)/i.test(rawDefinition)) addPos('Na-adjective');
+    else if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adj-i|i-adjective)/i.test(rawDefinition)) addPos('I-adjective');
+    else if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adjective|tính từ)/i.test(rawDefinition)) addPos('Adjective');
+    if (/(?:^|\s|<[^>]*>|[\d\W_])(?:adverb|adv|phó từ)/i.test(rawDefinition)) addPos('Adverb');
   }
-
-  // Extract <li> elements if any
-  const liMatches = Array.from(text.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi));
-  const rawItems = [];
-  const remainingLines = text.split(/\r?\n|<br\s*\/?>/i)
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  if (liMatches.length > 0) {
-    liMatches.forEach((m) => {
-      rawItems.push(m[1]);
-    });
-    // Check if remaining lines contain any Japanese example sentences that weren't inside example blocks
-    if (examples.length === 0) {
-      for (let i = 0; i < remainingLines.length; i++) {
-        const line = remainingLines[i];
-        const textOnly = line.replace(/<[^>]*>/g, '').trim();
-        const hasJpChars = /[\u3040-\u30ff\u4e00-\u9faf]/.test(textOnly);
-        const isJpSentence = (hasJpChars && (textOnly.length >= 8 || /[\u3040-\u30ff]/.test(textOnly))) || /<ruby>/i.test(line);
-        if (isJpSentence) {
-          const nextLine = remainingLines[i + 1] ? remainingLines[i + 1].replace(/<[^>]*>/g, '').trim() : '';
-          let trans = '';
-          if (nextLine && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(nextLine) && nextLine.length > 2 && !nextLine.includes('JMdict') && !nextLine.includes('Tatoeba')) {
-            trans = nextLine.replace(/\[\d+\]/g, '').trim();
-            i++;
-          }
-          const cleanJp = line.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
-          let viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: trans });
-          examples.push({ jp: line, vi: viTrans });
-          break;
-        }
-      }
-    }
-  } else {
-    // Process remaining lines when no <li> tags exist
-    for (let i = 0; i < remainingLines.length; i++) {
-      const line = remainingLines[i];
-      const textOnly = line.replace(/<[^>]*>/g, '').trim();
-
-      // Check if line is a Japanese example sentence
-      const hasJpChars = /[\u3040-\u30ff\u4e00-\u9faf]/.test(textOnly);
-      const isJpSentence = (hasJpChars && (textOnly.length >= 8 || /[\u3040-\u30ff]/.test(textOnly))) || /<ruby>/i.test(line);
-
-      if (isJpSentence) {
-        const nextLine = remainingLines[i + 1] ? remainingLines[i + 1].replace(/<[^>]*>/g, '').trim() : '';
-        let trans = '';
-        if (nextLine && !/[\u3040-\u30ff\u4e00-\u9faf]/.test(nextLine) && nextLine.length > 2 && !nextLine.includes('JMdict') && !nextLine.includes('Tatoeba')) {
-          trans = nextLine.replace(/\[\d+\]/g, '').trim();
-          i++; // skip translation line
-        }
-        const cleanJp = line.replace(/<rt>[\s\S]*?<\/rt>/gi, '').replace(/<[^>]*>/g, '').trim();
-        let viTrans = await translateExampleSentenceToVietnamese({ ja: cleanJp, en: trans });
-        examples.push({ jp: line, vi: viTrans });
-        continue;
-      }
-
-      rawItems.push(line);
-    }
-  }
-
-  // Clean each meaning item: strip pos badges and prefix keywords
-  const cleanPosRegex = /^(?:<span[^>]*pos-badge[^>]*>[\s\S]*?<\/span>|<[^>]*data-content="partOfSpeech"[^>]*>[\s\S]*?<\/[^>]*>)/gi;
-  const prefixKeywords = /^(?:noun|suru|vs|vt|vi|transitive|intransitive|adjective|adverb|danh từ|động từ\s+suru|động từ|tính từ|phó từ|tự động từ|tha động từ|chuyển\s*tiếp)[\s,•\.\-]*/gi;
-
-  const meaningItems = [];
-  rawItems.forEach((item) => {
-    let s = item.replace(cleanPosRegex, '');
-    s = s.replace(/<[^>]*>/g, '').trim();
-    while (prefixKeywords.test(s)) {
-      s = s.replace(prefixKeywords, '').trim();
-    }
-    s = s.replace(/^(?:[•\-\*]|\d+[\.\)])\s*/, '').trim();
-    if (s && s.length > 1 && !s.includes('JMdict') && !s.includes('Tatoeba')) {
-      meaningItems.push(s);
-    }
-  });
 
   // Fallback to AI data if dictionary was completely empty
-  if (meaningItems.length === 0 && (aiData?.meanings_en || aiData?.meanings_vi)) {
-    meaningItems.push(...(aiData.meanings_en || aiData.meanings_vi));
+  const totalSenses = groups.reduce((acc, g) => acc + g.senses.length, 0);
+  if (totalSenses === 0 && (aiData?.meanings_en || aiData?.meanings_vi)) {
+    const aiMeanings = aiData.meanings_en || aiData.meanings_vi;
+    groups.push({
+      pos: aiData.pos_en || aiData.pos_vi || '',
+      senses: aiMeanings.map((m, idx) => ({
+        index: idx + 1,
+        text: m,
+        labels: [],
+        examples: [],
+        notes: ''
+      }))
+    });
   }
   if (posList.length === 0 && (aiData?.pos_en || aiData?.pos_vi)) {
     (aiData.pos_en || aiData.pos_vi).split(/[•,]/).forEach((p) => addPos(p.trim()));
   }
 
-  // 1. If an AI example was generated by the user (or passed in providedExample/cached), include it prominently!
+  // Determine all dictionary example texts to prevent duplicate AI examples
+  const allDictJp = new Set();
+  groups.forEach(g => {
+    g.senses.forEach(s => {
+      s.examples.forEach(e => {
+        allDictJp.add(e.jp.replace(/<[^>]*>/g, '').trim());
+      });
+    });
+  });
+
+  // Handle AI Example
   const userAiEx = (providedExample && (providedExample.jp || providedExample.ex_ruby || providedExample.ex_furigana))
     ? providedExample
-    : (word && aiExampleCache.has(word) ? aiExampleCache.get(word) : null);
+    : (word && aiExampleCache.has(getAiExampleCacheKey(word, reading))
+        ? aiExampleCache.get(getAiExampleCacheKey(word, reading))
+        : null);
 
+  let aiExample = null;
   if (userAiEx) {
     const aiJp = ensureRubyFurigana(userAiEx.jp || userAiEx.ex_ruby || userAiEx.ex_furigana);
     const aiVi = userAiEx.vi || userAiEx.ex_vi || '';
     const cleanAiJp = aiJp.replace(/<[^>]*>/g, '').trim();
 
-    // Check if not already in examples
-    const alreadyExists = examples.some((e) => e.jp.replace(/<[^>]*>/g, '').trim() === cleanAiJp);
-    if (!alreadyExists) {
-      examples.unshift({
-        title: '✨ Ví dụ AI (Gemini)',
-        isAi: true,
+    if (!allDictJp.has(cleanAiJp)) {
+      aiExample = {
+        title: '✨ Ví dụ AI · Gemini',
         jp: aiJp,
-        vi: aiVi
-      });
+        vi: aiVi,
+        senseIndex: Number(userAiEx.sense_index || userAiEx.senseIndex) || null
+      };
     }
-  } else if (examples.length === 0) {
-    if (aiData?.ex_ruby) {
-      examples.push({
-        title: '✨ Ví dụ AI (Gemini)',
-        isAi: true,
-        jp: ensureRubyFurigana(aiData.ex_ruby),
-        vi: aiData.ex_vi || ''
-      });
+  } else if (aiData?.ex_ruby) {
+    const aiJp = ensureRubyFurigana(aiData.ex_ruby);
+    const cleanAiJp = aiJp.replace(/<[^>]*>/g, '').trim();
+    if (!allDictJp.has(cleanAiJp)) {
+      aiExample = {
+        title: '✨ Ví dụ AI · Gemini',
+        jp: aiJp,
+        vi: aiData.ex_vi || '',
+        senseIndex: Number(aiData.sense_index) || null
+      };
     }
   }
 
-  // Build HTML Badges
+  if (aiExample) {
+    const validSenseIndexes = new Set(groups.flatMap((group) => group.senses.map((sense) => sense.index)));
+    if (validSenseIndexes.size === 1 && !validSenseIndexes.has(aiExample.senseIndex)) {
+      aiExample.senseIndex = Array.from(validSenseIndexes)[0];
+    } else if (!validSenseIndexes.has(aiExample.senseIndex)) {
+      aiExample.senseIndex = null;
+    }
+  }
+
+  const renderAiExampleCard = (example, isGeneral = false) => example ? `
+    <div class="lab-example-card lab-ai-example-card" style="margin-top:8px; padding:10px 14px; background:#faf5ff; border:1px solid #e9d5ff; border-left:3px solid #9333ea !important; border-radius:0 8px 8px 0; box-shadow:0 1px 3px rgba(0,0,0,0.02);">
+      <div class="example-title" style="font-size:10.5px; font-weight:800; color:#7e22ce; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:5px;">
+        ${isGeneral ? '✨ Ví dụ AI tổng quát · Gemini' : (example.title || '✨ Ví dụ AI · Gemini')}
+      </div>
+      <div class="example-jp" style="font-size:16px; font-weight:600; line-height:1.9; color:var(--lab-text, #1e293b); margin-bottom:4px;">
+        ${ensureRubyFurigana(example.jp)}
+      </div>
+      ${example.vi ? `
+      <div class="example-vi" style="font-size:13.5px; color:var(--lab-muted, #475569); font-style:italic; line-height:1.5;">
+        ${escapeHtml(example.vi)}
+      </div>` : ''}
+    </div>
+  ` : '';
+
+  // Build Top POS Badges
   const posBadges = posList.map((s, idx) => {
     const bgColors = [
       'background:#eff6ff; color:#1e40af; border-color:#bfdbfe;',
@@ -1633,47 +2126,260 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, word, readin
     return `<span class="lab-pos-badge" style="display:inline-flex; align-items:center; ${style} font-size:13px; font-weight:700; padding:4px 12px; border-radius:9999px; border-width:1px; border-style:solid; box-shadow:0 1px 2px rgba(0,0,0,0.04); letter-spacing:0.02em;">${escapeHtml(s)}</span>`;
   }).join(' ');
 
-  // Build HTML Meanings List
-  const defsList = (meaningItems.length > 0 ? meaningItems : ['Definition'])
-    .map((m, idx) => `
-      <div class="lab-meaning-item" style="display:flex; align-items:flex-start; gap:12px; padding:10px 14px; background:var(--lab-surface, #ffffff); border:1px solid var(--lab-border, #e2e8f0); border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.03); margin-bottom:8px;">
-        <span class="num-badge" style="display:inline-flex; justify-content:center; align-items:center; width:22px; height:22px; background:var(--lab-accent, #b54834); color:#ffffff; border-radius:50%; font-size:12px; font-weight:700; flex-shrink:0; margin-top:2px;">${idx + 1}</span>
-        <span class="meaning-text" style="font-size:16px; font-weight:600; color:var(--lab-text, #1e293b); line-height:1.5;">${escapeHtml(m)}</span>
-      </div>
-    `)
-    .join('');
+  // Whether to show POS headers per group (when multiple distinct POS groups exist)
+  const showGroupPos = groups.length > 1 && groups.some(g => g.pos);
 
-  // Build HTML Example Cards
-  const exampleSection = examples.length > 0 ? `
-    <div class="lab-examples-container" style="margin-top: 16px;">
-      ${examples.map((ex, idx) => `
-        <div class="lab-example-card" style="margin-top: ${idx === 0 ? '0' : '12px'}; padding: 14px 18px; background: ${ex.isAi ? '#faf5ff' : 'var(--lab-surface, #fffdf8)'}; border: 1px solid ${ex.isAi ? '#e9d5ff' : 'var(--lab-border, #ebd8c8)'}; border-left: 4px solid ${ex.isAi ? '#9333ea' : 'var(--lab-accent, #b54834)'}; border-radius: 0 12px 12px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.03);">
-          <div class="example-title" style="font-size: 11px; font-weight: 800; color: ${ex.isAi ? '#7e22ce' : 'var(--lab-accent, #b54834)'}; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">
-            ${ex.title || `Ví dụ ngữ cảnh ${examples.length > 1 ? `(${idx + 1})` : ''}`}
+  // Build Meanings List with Examples Nested Directly Under Senses
+  const renderedGroupsHtml = groups.map((g, gIdx) => {
+    const groupPosHtml = showGroupPos && g.pos ? `
+      <div class="lab-pos-group-header" style="margin-top:${gIdx === 0 ? '0' : '16px'}; margin-bottom:10px;">
+        <span class="lab-pos-badge" style="display:inline-flex; align-items:center; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; font-size:12.5px; font-weight:700; padding:4px 12px; border-radius:9999px; letter-spacing:0.02em;">
+          ${escapeHtml(g.pos)}
+        </span>
+      </div>
+    ` : '';
+
+    const sensesHtml = (g.senses.length > 0 ? g.senses : [{ index: 1, text: 'Definition', labels: [], examples: [], notes: '' }])
+      .map(sense => {
+        const senseAiExample = aiExample && aiExample.senseIndex === sense.index ? aiExample : null;
+        return `
+        <div class="lab-meaning-item" style="display:flex; flex-direction:column; gap:0; padding:10px 14px; background:var(--lab-surface, #ffffff); border:1px solid var(--lab-border, #e2e8f0); border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.03); margin-bottom:8px;">
+          <div class="lab-meaning-row" style="display:flex; align-items:flex-start; gap:12px; width:100%;">
+            <span class="num-badge" style="display:inline-flex; justify-content:center; align-items:center; width:22px; height:22px; background:var(--lab-accent, #b54834); color:#ffffff; border-radius:50%; font-size:12px; font-weight:700; flex-shrink:0; margin-top:2px;">
+              ${sense.index}
+            </span>
+            <div style="flex:1; min-width:0;">
+              ${sense.labels && sense.labels.length > 0 ? `
+              <div class="sense-labels" style="display:flex; flex-wrap:wrap; gap:5px; margin-bottom:5px;">
+                ${sense.labels.map((label) => `<span style="display:inline-flex; align-items:center; padding:2px 7px; border-radius:999px; background:#f1f5f9; border:1px solid #cbd5e1; color:#475569; font-size:10.5px; font-weight:700;">${escapeHtml(label)}</span>`).join('')}
+              </div>` : ''}
+              <span class="meaning-text" style="font-size:16px; font-weight:600; color:var(--lab-text, #1e293b); line-height:1.5;">
+                ${escapeHtml(sense.text)}
+              </span>
+              ${sense.notes ? `
+              <div class="sense-notes" style="font-size:12.5px; color:#64748b; margin-top:3px; font-style:italic;">
+                ${escapeHtml(sense.notes)}
+              </div>` : ''}
+            </div>
           </div>
-          <div class="example-jp" style="font-size: 17px; font-weight: 600; line-height: 2; color: var(--lab-text, #1e293b); margin-bottom: 6px;">
-            ${ensureRubyFurigana(ex.jp)}
-          </div>
-          ${ex.vi ? `
-          <div class="example-vi" style="font-size: 14.5px; color: var(--lab-muted, #475569); font-style: italic; line-height: 1.55;">
-            ${escapeHtml(ex.vi)}
+
+          ${sense.examples && sense.examples.length > 0 ? `
+          <div class="sense-examples" style="margin-top:8px; margin-left:34px;">
+            <div class="example-title" style="font-size:10.5px; font-weight:800; color:#b54834; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:5px;">
+              Ví dụ từ điển
+            </div>
+            ${sense.examples.map((ex, exIdx) => `
+              <div class="lab-example-card" style="margin-top:${exIdx === 0 ? '0' : '6px'}; padding:10px 14px; background:var(--lab-surface, #fffdf8); border:1px solid var(--lab-border, #ebd8c8); border-left:3px solid var(--lab-accent, #b54834) !important; border-radius:0 8px 8px 0; box-shadow:0 1px 3px rgba(0,0,0,0.02);">
+                <div class="example-jp" style="font-size:16px; font-weight:600; line-height:1.9; color:var(--lab-text, #1e293b); margin-bottom:4px;">
+                  ${ensureRubyFurigana(ex.jp)}
+                </div>
+                ${ex.vi ? `
+                <div class="example-vi" style="font-size:13.5px; color:var(--lab-muted, #475569); font-style:italic; line-height:1.5;">
+                  ${escapeHtml(ex.vi)}
+                </div>` : ''}
+              </div>
+            `).join('')}
           </div>` : ''}
+
+          ${senseAiExample ? `<div class="sense-ai-example" style="margin-left:34px;">${renderAiExampleCard(senseAiExample)}</div>` : ''}
         </div>
-      `).join('')}
-    </div>
-  ` : '';
+      `;
+      })
+      .join('');
+
+    return `${groupPosHtml}${sensesHtml}`;
+  }).join('');
 
   return `
-    ${posBadges ? `<div class="lab-pos-row" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;">${posBadges}</div>` : ''}
-    <div class="lab-meanings-list">${defsList}</div>
-    ${exampleSection}
+    ${posBadges && !showGroupPos ? `<div class="lab-pos-row" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;">${posBadges}</div>` : ''}
+    <div class="lab-meanings-list">
+      ${renderedGroupsHtml}
+    </div>
+    ${aiExample && aiExample.senseIndex === null ? `<div class="lab-general-ai-example" style="margin-top:12px;">${renderAiExampleCard(aiExample, true)}</div>` : ''}
   `;
+}
+
+const audioUrlCache = new Map();
+
+/**
+ * Convert ArrayBuffer to Base64 safely without call stack limits
+ */
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const len = bytes.byteLength;
+  const chunkSize = 8192;
+  for (let i = 0; i < len; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, len)));
+  }
+  return btoa(binary);
+}
+
+/**
+ * Robustly download audio with automatic retries, backoff, and fallback across multiple providers:
+ * 1. JapanesePod101 (Native audio)
+ * 2. Youdao Dictvoice (Kana reading)
+ * 3. Google Translate TTS (Kana reading)
+ * 4. Youdao Dictvoice (Word fallback)
+ */
+async function downloadAudioWithFallbackAndRetry({ word, reading, providedUrl, maxRetries = 3 }) {
+  const cleanWord = (word || '').trim();
+  const cleanReading = (reading || cleanWord).trim();
+  const safeWord = encodeURIComponent(cleanWord);
+  const safeReading = encodeURIComponent(cleanReading);
+  const filename = `jlex_${safeWord}_${safeReading}_${Date.now()}.mp3`;
+
+  const urlsToTry = [];
+
+  // Add provided URL if present and looks like a specific reading or native audio
+  if (providedUrl && !providedUrl.includes('52288')) {
+    urlsToTry.push(providedUrl);
+  }
+
+  // 1. Try JapanesePod101 native audio
+  if (cleanWord && cleanReading) {
+    try {
+      const jpodUrl = `https://assets.languagepod101.com/dictionary/japanese/audiomp3.php?kanji=${encodeURIComponent(cleanWord)}&kana=${encodeURIComponent(cleanReading)}`;
+      const resJ = await fetch(jpodUrl, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(3500) });
+      if (resJ.status === 301 || resJ.status === 302) {
+        const loc = resJ.headers.get('Location');
+        if (loc && !loc.includes('52288') && !urlsToTry.includes(loc)) {
+          urlsToTry.push(loc);
+        }
+      }
+    } catch (e) {
+      // JPod check error
+    }
+  }
+
+  // 2. Youdao dictvoice with reading (kana)
+  const youdaoKanaUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(cleanReading)}&le=jap`;
+  if (!urlsToTry.includes(youdaoKanaUrl)) {
+    urlsToTry.push(youdaoKanaUrl);
+  }
+
+  // 3. Google Translate TTS with reading (kana)
+  const googleKanaUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ja&q=${encodeURIComponent(cleanReading)}`;
+  if (!urlsToTry.includes(googleKanaUrl)) {
+    urlsToTry.push(googleKanaUrl);
+  }
+
+  // 4. Youdao dictvoice with word (fallback)
+  if (cleanWord && cleanWord !== cleanReading) {
+    const youdaoWordUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(cleanWord)}&le=jap`;
+    if (!urlsToTry.includes(youdaoWordUrl)) {
+      urlsToTry.push(youdaoWordUrl);
+    }
+  }
+
+  // Attempt download with retries across candidate URLs
+  for (const url of urlsToTry) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(6000)
+        });
+
+        if (res.ok) {
+          const buffer = await res.arrayBuffer();
+          // Filter out empty responses or JPOD 52288 placeholder
+          if (buffer.byteLength > 500 && buffer.byteLength !== 52288) {
+            return {
+              success: true,
+              buffer,
+              filename,
+              sourceUrl: url
+            };
+          }
+        } else if (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) {
+          console.warn(`[Audio Download] ${url} returned HTTP ${res.status} (attempt ${attempt}/${maxRetries}), retrying...`);
+        }
+      } catch (err) {
+        console.warn(`[Audio Download] Attempt ${attempt}/${maxRetries} failed for ${url}:`, err.message);
+      }
+
+      // Backoff delay before retry
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, attempt * 600));
+      }
+    }
+  }
+
+  return { success: false, filename };
+}
+
+/**
+ * Resolve the best audio URL for Japanese vocabulary:
+ * 1. Checks JapanesePod101 native human audio (supports kanji + kana combination).
+ * 2. If JPOD returns 301/302 redirect with Location, returns high-quality native recording!
+ * 3. Verifies Youdao TTS with reading (retries once on 500).
+ * 4. Fallbacks to Google Translate TTS if Youdao is down/failing.
+ */
+async function handleGetAudioUrl({ word, reading }) {
+  const cleanWord = (word || '').trim();
+  const cleanReading = (reading || cleanWord).trim();
+  if (!cleanWord && !cleanReading) {
+    return { audioUrl: '' };
+  }
+
+  const cacheKey = `${cleanWord}#${cleanReading}`;
+  if (audioUrlCache.has(cacheKey)) {
+    return { audioUrl: audioUrlCache.get(cacheKey) };
+  }
+
+  // 1. Try JapanesePod101 native audio
+  if (cleanWord && cleanReading) {
+    try {
+      const jpodUrl = `https://assets.languagepod101.com/dictionary/japanese/audiomp3.php?kanji=${encodeURIComponent(cleanWord)}&kana=${encodeURIComponent(cleanReading)}`;
+      const res = await fetch(jpodUrl, {
+        method: 'HEAD',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(3500)
+      });
+
+      if (res.status === 301 || res.status === 302) {
+        const loc = res.headers.get('Location');
+        if (loc && !loc.includes('52288')) {
+          audioUrlCache.set(cacheKey, loc);
+          return { audioUrl: loc };
+        }
+      }
+    } catch (e) {
+      // JPod lookup error or timeout, proceed to Youdao fallback
+    }
+  }
+
+  // 2. Try Youdao dictvoice using the exact phonetic reading (kana)
+  const targetPronounce = cleanReading || cleanWord;
+  const youdaoUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(targetPronounce)}&le=jap`;
+
+  // Quick verify Youdao (with 1 retry on 500)
+  for (let i = 0; i < 2; i++) {
+    try {
+      const resY = await fetch(youdaoUrl, { method: 'HEAD', signal: AbortSignal.timeout(2500) });
+      if (resY.ok) {
+        audioUrlCache.set(cacheKey, youdaoUrl);
+        return { audioUrl: youdaoUrl };
+      }
+      if (resY.status === 500) {
+        await new Promise((r) => setTimeout(r, 400));
+        continue;
+      }
+    } catch (e) {
+      // Youdao network error
+    }
+  }
+
+  // 3. Fallback to Google Translate TTS
+  const googleUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ja&q=${encodeURIComponent(targetPronounce)}`;
+  audioUrlCache.set(cacheKey, googleUrl);
+  return { audioUrl: googleUrl };
 }
 
 /**
  * Handle AnkiConnect export with Linguist Japanese Vocab Template, Native Audio Download & Stroke Order
  */
-async function handleAddToAnki({ word, reading, hanviet, definition, example, aiExample, audioUrl }) {
+async function handleAddToAnki({ word, reading, hanviet, definition, example, aiExample, audioUrl, rawDefinitions }) {
   const config = await chrome.storage.local.get({
     ankiUrl: 'http://localhost:8765',
     deckName: 'Japanese_Learning',
@@ -1696,12 +2402,18 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
   const cleanWord = (word || '').trim();
   const cleanReading = (reading || cleanWord).trim();
   const cleanHanviet = (hanviet || '').trim();
+  const displayHanviet = formatHanvietDisplay(cleanHanviet);
+  const readingWithHanviet = [
+    cleanReading && cleanReading !== cleanWord ? `【${escapeHtml(cleanReading)}】` : '',
+    displayHanviet ? `<strong class="jlex-hanviet-reading" style="margin-left:8px; letter-spacing:.04em; color:#b54834;">${escapeHtml(displayHanviet)}</strong>` : ''
+  ].filter(Boolean).join(' ');
   const cleanDefinition = (definition || '').trim();
 
   // Check duplicate before proceeding
   const existCheck = await handleCheckNoteExists({ word: cleanWord, reading: cleanReading, deckName });
   if (existCheck.exists) {
-    throw new Error(`Từ "${cleanWord}" đã tồn tại trong deck "${deckName}" của Anki.`);
+    const readingSuffix = cleanReading && cleanReading !== cleanWord ? ` (cách đọc: 【${cleanReading}】)` : '';
+    throw new Error(`Từ "${cleanWord}"${readingSuffix} đã tồn tại trong deck "${deckName}" của Anki.`);
   }
 
   // Ensure target deck exists
@@ -1717,13 +2429,22 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
 
   const providedExample = aiExample || (example && typeof example === 'object' ? example : null);
 
-  // 1. Analyze word via Gemini AI if no example provided and key is present
+  // Parse once so dictionary grouping and Gemini sense_index use the exact same ordering.
+  const parsedSenseGroups = await parseDictionarySenses(cleanDefinition, rawDefinitions);
+  const definitionForAi = parsedSenseGroups.length > 0
+    ? parsedSenseGroups.map((group) => {
+        const posHeader = group.pos ? `[${group.pos}]\n` : '';
+        return `${posHeader}${group.senses.map((sense) => `${sense.index}. ${sense.text}`).join('\n')}`;
+      }).join('\n')
+    : cleanDefinition.replace(/<li[^>]*>/gi, '\n').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // 1. Analyze word via Gemini AI if a key is present
   let aiData = null;
   try {
     aiData = await handleGeminiAnalyzeWord({
       word: cleanWord,
       reading: cleanReading,
-      definition: cleanDefinition
+      definition: definitionForAi
     });
   } catch (e) {
     console.warn('[Anki] Gemini word analysis skipped or failed:', e.message);
@@ -1733,6 +2454,8 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
   const meaningHtml = await formatBeautifiedMeaningHtml({
     aiData,
     rawDefinition: cleanDefinition,
+    rawDefinitions,
+    parsedGroups: parsedSenseGroups,
     word: cleanWord,
     reading: cleanReading,
     providedExample
@@ -1795,7 +2518,7 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
 
       if (expField) fields[expField] = cleanWord;
       if (audioField) {
-        fields[audioField] = cleanReading && cleanReading !== cleanWord ? `【${cleanReading}】` : '';
+        fields[audioField] = readingWithHanviet;
         targetAudioField = audioField;
       }
       if (meaningField) {
@@ -1823,7 +2546,7 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
   <header class="lab-answer" style="text-align: center; margin-bottom: 16px; padding: 18px; border: 1px solid #d9d1c4; border-radius: 18px; background: #fffdf8;">
     <div class="lab-kicker" style="color: #b54834; font-size: 11px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase;">Tiếng Nhật</div>
     <div class="lab-expression" lang="ja" style="font-size: 38px; font-weight: 700; font-family: 'Noto Serif JP', serif; margin: 4px 0; color: #1e3a8a;">${escapeHtml(cleanWord)}</div>
-    ${cleanReading && cleanReading !== cleanWord ? `<div class="lab-reading" lang="ja" style="font-size: 18px; font-weight: 600; color: #b54834; margin-top: 4px;">【${escapeHtml(cleanReading)}】</div>` : ''}
+    ${readingWithHanviet ? `<div class="lab-reading" style="font-size: 18px; font-weight: 600; color: #b54834; margin-top: 4px;"><span lang="ja">${cleanReading && cleanReading !== cleanWord ? `【${escapeHtml(cleanReading)}】` : ''}</span>${displayHanviet ? ` <strong style="margin-left:8px; letter-spacing:.04em;">${escapeHtml(displayHanviet)}</strong>` : ''}</div>` : ''}
   </header>
 
   <section class="lab-panel lab-meaning" style="margin-bottom: 14px; padding: 16px; border: 1px solid #d9d1c4; border-radius: 14px; background: #fffdf8;">
@@ -1847,7 +2570,7 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
         const lower = f.toLowerCase();
         if (/word|expression|vocab/i.test(lower)) fields[f] = cleanWord;
         else if (/reading|kana|furigana/i.test(lower)) {
-          fields[f] = cleanReading;
+          fields[f] = readingWithHanviet || escapeHtml(cleanReading);
           if (!targetAudioField) targetAudioField = f;
         } else if (/hanviet|han-viet|kanji/i.test(lower)) fields[f] = kanjiCardsHtml || cleanHanviet;
         else if (/meaning|definition|glossary/i.test(lower)) fields[f] = meaningHtml;
@@ -1862,8 +2585,57 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
   } else {
     // Fallback if no model fields returned
     fields['Front'] = cleanWord;
-    fields['Back'] = `${cleanReading}<br>${meaningHtml}${kanjiCardsHtml ? `<br>${kanjiCardsHtml}` : ''}`;
+    fields['Back'] = `${readingWithHanviet || escapeHtml(cleanReading)}<br>${meaningHtml}${kanjiCardsHtml ? `<br>${kanjiCardsHtml}` : ''}`;
     targetAudioField = 'Back';
+  }
+
+  // 7. Download audio directly in extension with automatic retry and multi-source fallback,
+  // then upload to Anki via storeMediaFile. This avoids AnkiConnect python urllib 500 download crashes!
+  let storedAudioFilename = null;
+  if (targetAudioField) {
+    try {
+      const audioResult = await downloadAudioWithFallbackAndRetry({
+        word: cleanWord,
+        reading: cleanReading,
+        providedUrl: audioUrl,
+        maxRetries: 3
+      });
+
+      if (audioResult && audioResult.success && audioResult.buffer) {
+        const base64Data = bufferToBase64(audioResult.buffer);
+        const storeRes = await fetch(ankiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'storeMediaFile',
+            version: 6,
+            params: {
+              filename: audioResult.filename,
+              data: base64Data
+            }
+          })
+        });
+
+        if (storeRes.ok) {
+          const storeData = await storeRes.json();
+          if (!storeData.error) {
+            storedAudioFilename = audioResult.filename;
+          }
+        }
+      }
+    } catch (audioErr) {
+      console.warn('[Anki] Audio download or storeMediaFile failed after retries:', audioErr);
+    }
+  }
+
+  // 8. Attach [sound:filename] to the target audio field
+  if (storedAudioFilename && targetAudioField) {
+    const currentVal = (fields[targetAudioField] || '').trim();
+    if (!currentVal.includes(`[sound:${storedAudioFilename}]`)) {
+      fields[targetAudioField] = currentVal
+        ? `${currentVal} [sound:${storedAudioFilename}]`
+        : `[sound:${storedAudioFilename}]`;
+    }
   }
 
   const payload = {
@@ -1875,24 +2647,13 @@ async function handleAddToAnki({ word, reading, hanviet, definition, example, ai
         modelName,
         fields,
         options: {
-          allowDuplicate: false,
+          allowDuplicate: true,
           duplicateScope: 'deck'
         },
         tags: ['j-lexicon-ai']
       }
     }
   };
-
-  // 7. Download audio directly into Anki Media collection via AnkiConnect native audio downloader
-  if (audioUrl && targetAudioField) {
-    payload.params.note.audio = [
-      {
-        url: audioUrl,
-        filename: `jlex_${encodeURIComponent(cleanWord)}_${Date.now()}.mp3`,
-        fields: [targetAudioField]
-      }
-    ];
-  }
 
   const response = await fetch(ankiUrl, {
     method: 'POST',
@@ -2154,13 +2915,43 @@ rt {
 
 .lab-meaning-item {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
+  flex-direction: column;
+  gap: 0;
   padding: 10px 14px;
   background: var(--lab-surface, #ffffff);
   border: 1px solid var(--lab-border, #e2e8f0);
   border-radius: 10px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, .03);
+}
+
+.lab-meaning-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+}
+
+.sense-examples {
+  margin-top: 8px;
+  margin-left: 34px;
+}
+
+.sense-examples .lab-example-card {
+  margin-top: 6px;
+  padding: 10px 14px;
+  border-left-width: 3px !important;
+}
+
+.sense-notes {
+  font-size: 12.5px;
+  color: var(--lab-muted, #64748b);
+  margin-top: 3px;
+  font-style: italic;
+}
+
+.lab-pos-group-header {
+  margin-top: 14px;
+  margin-bottom: 8px;
 }
 
 .lab-meaning-item .num-badge {
@@ -2296,6 +3087,16 @@ rt {
   background: #23221f !important;
   border-color: #46423b !important;
   border-left-color: #ef8f79 !important;
+}
+
+.nightMode .lab-ai-example-card {
+  background: #251b33 !important;
+  border-color: #581c87 !important;
+  border-left-color: #c084fc !important;
+}
+
+.nightMode .lab-ai-example-card .example-title {
+  color: #d8b4fe !important;
 }
 
 .nightMode .lab-example-card .example-jp {
@@ -2498,15 +3299,15 @@ async function handleTestAnki({ ankiUrl, modelName }) {
 /**
  * Test Gemini API connection
  */
-async function handleTestGemini({ apiKey, model = 'gemini-2.5-flash' }) {
+async function handleTestGemini({ apiKey, model = DEFAULT_GEMINI_MODEL }) {
   if (!apiKey) throw new Error('Vui lòng nhập API Key');
 
   // Fetch available models for the dropdown
-  const availableModels = await fetchAvailableGeminiModels(apiKey);
+  const availableModels = await fetchAvailableGeminiModels(apiKey, true);
 
-  let targetModel = (model || 'gemini-2.5-flash').trim().replace(/^models\//, '');
+  let targetModel = (model || DEFAULT_GEMINI_MODEL).trim().replace(/^models\//, '');
   if (targetModel.startsWith('gemma-')) {
-    targetModel = 'gemini-2.5-flash';
+    targetModel = DEFAULT_GEMINI_MODEL;
   }
 
   const testBody = {
@@ -2521,7 +3322,9 @@ async function handleTestGemini({ apiKey, model = 'gemini-2.5-flash' }) {
 
   return {
     response: responseText,
-    usedModel: targetModel,
+    usedModel: data.__jlexModel || targetModel,
+    requestedModel: targetModel,
+    usedFallback: Boolean(data.__jlexFallback),
     availableModels
   };
 }

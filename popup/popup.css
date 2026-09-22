@@ -4,8 +4,14 @@
   padding: 0;
 }
 
+html,
 body {
   width: 360px;
+  margin: 0;
+  padding: 0;
+}
+
+body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: #ffffff;
   color: #1f2937;
@@ -14,6 +20,7 @@ body {
 }
 
 .popup-wrap {
+  width: 100%;
   padding: 14px;
 }
 
@@ -213,6 +220,7 @@ input:checked + .slider:before {
   padding: 10px;
   margin-bottom: 8px;
   background: #f8fafc;
+  overflow-wrap: anywhere;
 }
 
 .result-header {
@@ -236,14 +244,11 @@ input:checked + .slider:before {
 
 .result-hanviet {
   display: inline-block;
-  font-size: 10px;
-  font-weight: 700;
-  color: #92400e;
-  background: #fef3c7;
-  border: 1px solid #fde68a;
-  padding: 1px 6px;
-  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  color: #b45309;
   margin-left: 6px;
+  letter-spacing: 0.04em;
 }
 
 .result-pos-badge {
@@ -264,6 +269,32 @@ input:checked + .slider:before {
   font-size: 12px;
   line-height: 1.4;
   margin: 6px 0;
+}
+
+/* For Jitendex structured-content defs that already have own ol/li */
+.result-defs-structured {
+  list-style: none;
+  padding: 0;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 6px 0;
+}
+
+.result-defs-structured > ol {
+  list-style: decimal inside;
+  padding-left: 14px;
+  margin: 0;
+}
+
+.result-defs-structured ul,
+.result-defs-structured ol {
+  padding-left: 18px;
+}
+
+.result-defs-structured > ol > li {
+  margin-bottom: 6px;
+  line-height: 1.5;
 }
 
 .result-btn-row {
@@ -342,4 +373,3 @@ input:checked + .slider:before {
 .jlex-sc-frequency {
   display: none;
 }
-

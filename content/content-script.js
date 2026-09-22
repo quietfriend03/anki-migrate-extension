@@ -170,14 +170,24 @@
       .jlex-badge-hanviet {
         display: inline-flex;
         align-items: center;
+        font-size: 12px;
+        font-weight: 800;
+        color: #b45309;
+        letter-spacing: 0.5px;
+      }
+
+      .jlex-badge-kana {
+        display: inline-flex;
+        align-items: center;
         padding: 2px 8px;
         font-size: 11px;
         font-weight: 700;
-        color: #92400e;
-        background-color: #fef3c7;
-        border: 1px solid #fde68a;
+        color: #5b21b6;
+        background-color: #ede9fe;
+        border: 1px solid #c4b5fd;
         border-radius: 9999px;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.3px;
+        font-family: inherit;
       }
 
       .jlex-pos-badge {
@@ -252,6 +262,33 @@
       }
 
       .jlex-definitions li {
+        margin-bottom: 8px;
+        line-height: 1.5;
+      }
+
+      /* Container for Jitendex structured-content definitions — structured-content has its own ol/li */
+      .jlex-definitions-structured {
+        list-style: none;
+        padding: 0;
+        margin: 0 0 12px 0;
+        color: #374151;
+        font-size: 13.5px;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+
+      .jlex-definitions-structured > ol {
+        list-style: decimal inside;
+        padding-left: 14px;
+        margin: 0;
+      }
+
+      .jlex-definitions-structured ul,
+      .jlex-definitions-structured ol {
+        padding-left: 18px;
+      }
+
+      .jlex-definitions-structured > ol > li {
         margin-bottom: 8px;
         line-height: 1.5;
       }
@@ -390,71 +427,95 @@
   }
 
   /**
-   * Play audio for a word
+   * Play audio for a word using phonetic reading (kana) or word
    */
-  function playAudio(word) {
-    if (!word) return;
+  function playAudio(word, reading) {
+    const cleanWord = (word || '').trim();
+    const cleanReading = (reading || cleanWord).trim();
+    if (!cleanWord && !cleanReading) return;
 
     if (currentAudio) {
       currentAudio.pause();
       currentAudio = null;
     }
 
-    const audioUrl = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(word)}&le=jap`;
-    const audio = new Audio(audioUrl);
-    currentAudio = audio;
-
-    const audioBtn = shadowRoot.querySelector('.jlex-btn-audio');
+    const audioBtn = shadowRoot?.querySelector('.jlex-btn-audio');
     if (audioBtn) audioBtn.classList.add('jlex-audio-playing');
 
-    audio.play().catch(() => {
-      // Fallback: Web Speech API synthesis
-      if ('speechSynthesis' in window) {
-        const utter = new SpeechSynthesisUtterance(word);
-        utter.lang = 'ja-JP';
-        window.speechSynthesis.speak(utter);
-      }
-    });
+    const stopPlaying = () => {
+      if (audioBtn) audioBtn.classList.remove('jlex-audio-playing');
+    };
 
-    audio.onended = () => {
-      if (audioBtn) audioBtn.classList.remove('jlex-audio-playing');
+    const fallbackTts = () => {
+      if ('speechSynthesis' in window) {
+        const utter = new SpeechSynthesisUtterance(cleanReading);
+        utter.lang = 'ja-JP';
+        utter.onend = stopPlaying;
+        utter.onerror = stopPlaying;
+        window.speechSynthesis.speak(utter);
+      } else {
+        stopPlaying();
+      }
     };
-    audio.onerror = () => {
-      if (audioBtn) audioBtn.classList.remove('jlex-audio-playing');
-    };
+
+    chrome.runtime.sendMessage(
+      { type: 'GET_AUDIO_URL', payload: { word: cleanWord, reading: cleanReading } },
+      (res) => {
+        const audioUrl = res?.data?.audioUrl || `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(cleanReading)}&le=jap`;
+        const audio = new Audio(audioUrl);
+        currentAudio = audio;
+        audio.onended = stopPlaying;
+        audio.onerror = fallbackTts;
+        audio.play().catch(fallbackTts);
+      }
+    );
   }
 
   /**
-   * Render Popup with word data
+   * Render Popup with word data and match navigation
    */
-  function renderPopup(data, x, y) {
+  function renderPopup(data, x, y, matchIndex = 0) {
     ensureShadowHost();
     removePopup();
 
     const popup = document.createElement('div');
     popup.className = 'jlex-popup';
 
+    const matches = data.matches && data.matches.length > 0 ? data.matches : [];
+    const totalMatches = matches.length;
+    let safeIndex = matchIndex;
+    if (totalMatches > 0) {
+      if (safeIndex < 0) safeIndex = totalMatches - 1;
+      if (safeIndex >= totalMatches) safeIndex = 0;
+    }
+
     // Best match item or fallback kanji
-    const match = (data.matches && data.matches.length > 0) ? data.matches[0] : null;
+    const match = totalMatches > 0 ? matches[safeIndex] : null;
     const term = match ? match.term : data.matchedText;
     const reading = match ? match.reading : '';
     const hanviet = match?.hanviet?.text || data.directHanviet?.text || '';
+    const displayHanviet = formatHanvietDisplay(hanviet);
     const defTags = match?.definitionTags || '';
 
     // Format definitions
     let defsListHtml = '';
     let definitionsPlain = '';
     let definitionsHtmlForAnki = '';
+    // Detect if definitions contain structured-content (Jitendex format)
+    // In this case we use <div> container instead of <ol> to avoid nested ol/li issues
+    let isStructuredDefs = false;
 
     if (match && match.definitions && match.definitions.length > 0) {
       defsListHtml = match.definitions
         .map((def) => {
           if (typeof def === 'string') return `<li>${escapeHtml(def)}</li>`;
-          if (Array.isArray(def)) return `<li>${renderStructuredContent(def)}</li>`;
-          if (def && typeof def === 'object') {
-            return `<li>${renderStructuredContent(def)}</li>`;
+          const rendered = renderStructuredContent(Array.isArray(def) ? def : def);
+          // If rendered content already has block-level list structure, don't wrap in <li>
+          if (/^<(ol|ul|li|div)/i.test(rendered.trim())) {
+            isStructuredDefs = true;
+            return rendered;
           }
-          return `<li>${escapeHtml(String(def))}</li>`;
+          return `<li>${rendered}</li>`;
         })
         .join('');
 
@@ -464,21 +525,30 @@
         .join('\n');
 
       definitionsHtmlForAnki = match.definitions
-        .map((d) => (typeof d === 'string' ? escapeHtml(d) : renderStructuredContent(d)))
+        .map((def) => {
+          if (typeof def === 'string') return `<li>${escapeHtml(def)}</li>`;
+          const rendered = renderStructuredContent(def);
+          if (/^<(ol|ul|li)/i.test(rendered.trim())) return rendered;
+          if (/<li/i.test(rendered)) return rendered;
+          return `<li>${rendered}</li>`;
+        })
         .filter(Boolean)
-        .join('<br>');
+        .join('');
     } else {
       defsListHtml = `<li><em>Không tìm thấy trong từ điển đã nạp.</em></li>`;
     }
 
+
     // Save active word data for Anki / Gemini actions
+    const targetKana = reading || term;
     activeWordData = {
       word: term,
       reading: reading || term,
       hanviet: hanviet,
       definition: definitionsHtmlForAnki || definitionsPlain,
       definitionPlain: definitionsPlain,
-      audioUrl: `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(term)}&le=jap`,
+      rawDefinitions: match?.definitions || null,
+      audioUrl: `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(targetKana)}&le=jap`,
       aiExample: null
     };
 
@@ -491,10 +561,18 @@
           ${reading ? `<span class="jlex-reading">${escapeHtml(reading)}</span>` : ''}
           <div class="jlex-term-row">
             <span class="jlex-term">${escapeHtml(term)}</span>
-            ${hanviet ? `<span class="jlex-badge-hanviet" title="Âm Hán-Việt">[HÁN-VIỆT: ${escapeHtml(hanviet)}]</span>` : ''}
+            ${reading ? `<span class="jlex-badge-kana" title="Cách đọc">【${escapeHtml(reading)}】</span>` : ''}
+            ${displayHanviet ? `<strong class="jlex-badge-hanviet" title="Âm Hán-Việt">${escapeHtml(displayHanviet)}</strong>` : ''}
           </div>
         </div>
-        <div class="jlex-actions-row">
+        <div class="jlex-actions-row" style="display: flex; align-items: center; gap: 4px;">
+          ${totalMatches > 1 ? `
+          <div class="jlex-pager" style="display: inline-flex; align-items: center; gap: 3px; font-size: 11px; font-weight: 700; color: #475569; background: #f1f5f9; padding: 2px 6px; border-radius: 6px; border: 1px solid #e2e8f0; margin-right: 2px;">
+            <button type="button" class="jlex-btn-pager jlex-btn-prev" title="Nghĩa / Cách đọc trước" style="background: none; border: none; font-size: 9px; cursor: pointer; color: #475569; padding: 1px 3px;">◀</button>
+            <span style="font-variant-numeric: tabular-nums;">${safeIndex + 1}/${totalMatches}</span>
+            <button type="button" class="jlex-btn-pager jlex-btn-next" title="Nghĩa / Cách đọc tiếp theo" style="background: none; border: none; font-size: 9px; cursor: pointer; color: #475569; padding: 1px 3px;">▶</button>
+          </div>
+          ` : ''}
           <button class="jlex-btn-icon jlex-btn-audio" title="Phát âm">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
@@ -519,9 +597,10 @@
       </div>
       ` : ''}
 
-      <ol class="jlex-definitions">
-        ${defsListHtml}
-      </ol>
+      ${isStructuredDefs
+        ? `<div class="jlex-definitions jlex-definitions-structured">${defsListHtml}</div>`
+        : `<ol class="jlex-definitions">${defsListHtml}</ol>`
+      }
 
       <div class="jlex-ai-example-box" style="margin: 10px 0; padding: 10px 12px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 8px; ${hasExample ? 'display: none;' : ''}">
         <div class="jlex-ai-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
@@ -596,16 +675,18 @@
               word: activeWordData.word,
               reading: activeWordData.reading,
               definition: activeWordData.definitionPlain,
+              rawDefinitions: activeWordData.rawDefinitions,
               forceRegenerate: force
             }
           },
           (res) => {
             if (loadingEl) loadingEl.style.display = 'none';
             if (res && res.success && res.data) {
-              const { ex_furigana, ex_vi } = res.data;
+              const { ex_furigana, ex_vi, sense_index } = res.data;
               activeWordData.aiExample = {
                 jp: ex_furigana,
-                vi: ex_vi
+                vi: ex_vi,
+                sense_index
               };
               if (jpEl) jpEl.innerHTML = ex_furigana;
               if (viEl) viEl.textContent = ex_vi;
@@ -648,7 +729,22 @@
 
     // Bind event listeners
     popup.querySelector('.jlex-btn-close').onclick = removePopup;
-    popup.querySelector('.jlex-btn-audio').onclick = () => playAudio(term);
+    popup.querySelector('.jlex-btn-audio').onclick = () => playAudio(term, reading);
+
+    const btnPrev = popup.querySelector('.jlex-btn-prev');
+    const btnNext = popup.querySelector('.jlex-btn-next');
+    if (btnPrev) {
+      btnPrev.onclick = (e) => {
+        e.stopPropagation();
+        renderPopup(data, x, y, safeIndex - 1);
+      };
+    }
+    if (btnNext) {
+      btnNext.onclick = (e) => {
+        e.stopPropagation();
+        renderPopup(data, x, y, safeIndex + 1);
+      };
+    }
 
     // Toggle Kanji Strokes Click
     const toggleStrokesBtn = popup.querySelector('.jlex-btn-toggle-strokes');
@@ -748,6 +844,7 @@
             reading: activeWordData.reading,
             hanviet: activeWordData.hanviet,
             definition: activeWordData.definition,
+            rawDefinitions: activeWordData.rawDefinitions,
             example: activeWordData.aiExample ? activeWordData.aiExample.jp : '',
             aiExample: activeWordData.aiExample,
             audioUrl: activeWordData.audioUrl
@@ -803,7 +900,9 @@
     const popupWidth = 360;
     const popupHeight = 320;
 
-    let posX = x + 10;
+    // Keep the panel visually anchored to the hovered word instead of making
+    // its whole width extend to the right of the cursor.
+    let posX = x - 24;
     let posY = y + 15;
 
     // Boundary check right
@@ -833,6 +932,15 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#039;');
+  }
+
+  function formatHanvietDisplay(hanviet) {
+    return String(hanviet || '')
+      .trim()
+      .split(/[\s-]+/)
+      .filter(Boolean)
+      .join('-')
+      .toLocaleUpperCase('vi-VN');
   }
 
   const POS_ENGLISH_MAP = {
@@ -936,7 +1044,7 @@
       // POS badge rendering
       if (node.data && typeof node.data === 'object' && node.data.content === 'partOfSpeech') {
         const posText = formatPosList(node.content);
-        return `<span class="jlex-pos-badge" style="display:inline-block; margin-right:6px; margin-bottom:4px;">${escapeHtml(posText)}</span>`;
+        return `<span class="jlex-pos-badge" style="display:inline-block; margin-right:6px; margin-bottom:4px;">${escapeHtml(posText)}</span> `;
       }
 
       // Skip forms and frequency blocks
