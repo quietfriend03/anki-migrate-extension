@@ -1969,7 +1969,11 @@ async function parseStructuredDictionarySenses(rawDefinitions) {
         (node) => /^(?:note|sense-note|extra-info)$/.test(getStructuredContentMarker(node)),
         true
       );
-      const notes = Array.from(new Set(noteNodes.map((node) => extractTextFromNode(node).trim()).filter(Boolean))).join(' • ');
+      const notes = Array.from(new Set(
+        noteNodes
+          .map((node) => stripEmbeddedExampleTail(extractTextFromNode(node)))
+          .filter((value) => value && !isKnownExampleText(value, examples))
+      )).join(' • ');
       senses.push({
         index: globalSenseIndex++,
         text: glosses.join('; '),
@@ -2065,12 +2069,14 @@ async function parseDictionarySenses(rawHtml, rawDefinitions = null) {
             examples.push({ jp: ex.jp, vi: viTrans });
           }
         }
+        const uniqueExamples = dedupeExamples(examples);
 
         // 2. Extract notes if any
         let notes = '';
         const notesMatch = defContent.match(/(?:<[^>]*class="[^"]*notes?[^"]*"[^>]*>|Note:\s*)([\s\S]*?)(?:<\/[^>]+>|$)/i);
         if (notesMatch) {
-          notes = notesMatch[1].replace(/<[^>]*>/g, '').trim();
+          notes = stripEmbeddedExampleTail(notesMatch[1].replace(/<[^>]*>/g, '').trim());
+          if (isKnownExampleText(notes, uniqueExamples)) notes = '';
         }
 
         // 3. Clean definition text
@@ -2089,7 +2095,7 @@ async function parseDictionarySenses(rawHtml, rawDefinitions = null) {
             text: defText,
             glosses: splitGlosses(defText),
             labels: [],
-            examples,
+            examples: uniqueExamples,
             notes
           });
         }
@@ -2332,6 +2338,7 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
     const sensesHtml = (g.senses.length > 0 ? g.senses : [{ index: 1, text: 'Definition', labels: [], examples: [], notes: '' }])
       .map(sense => {
         const senseAiExample = aiExample && aiExample.senseIndex === sense.index ? aiExample : null;
+        const safeSenseNotes = stripEmbeddedExampleTail(sense.notes);
         const senseGlosses = Array.isArray(sense.glosses) && sense.glosses.length > 0
           ? sense.glosses
           : splitGlosses(sense.text);
@@ -2354,9 +2361,9 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
                 ${sense.labels.map((label) => `<span style="display:inline-flex; align-items:center; padding:2px 7px; border-radius:999px; background:#f1f5f9; border:1px solid #cbd5e1; color:#475569; font-size:10.5px; font-weight:700;">${escapeHtml(label)}</span>`).join('')}
               </div>` : ''}
               ${meaningHtml}
-              ${sense.notes ? `
+              ${safeSenseNotes ? `
               <div class="sense-notes" style="font-size:12.5px; color:#64748b; margin-top:3px; font-style:italic;">
-                ${escapeHtml(sense.notes)}
+                ${escapeHtml(safeSenseNotes)}
               </div>` : ''}
             </div>
           </div>
