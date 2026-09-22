@@ -855,11 +855,69 @@ async function callGeminiApi(apiKey, model, requestBody) {
  */
 function ensureRubyFurigana(text) {
   if (!text) return '';
-  if (/<ruby>/i.test(text)) return text;
-  return text.replace(
+  return String(text).replace(
     /([\u4e00-\u9faf\u3400-\u4dbf]+)[(（\[]([ぁ-んァ-ヶー]+)[)）\]]/g,
     '<ruby>$1<rt>$2</rt></ruby>'
   );
+}
+
+/**
+ * Accept only safe, complete ruby markup from AI. Every kanji in the sentence
+ * must be inside a ruby element and every reading must contain kana only.
+ */
+function normalizeAndValidateAiFurigana(text) {
+  if (!text || typeof text !== 'string') return '';
+  let normalized = text
+    .replace(/```(?:html)?/gi, '')
+    .replace(/<rb>\s*([\s\S]*?)\s*<\/rb>/gi, '$1')
+    .replace(/<ruby>\s*/gi, '<ruby>')
+    .replace(/\s*<rt>\s*/gi, '<rt>')
+    .replace(/\s*<\/rt>\s*/gi, '</rt>')
+    .replace(/\s*<\/ruby>/gi, '</ruby>')
+    .trim();
+
+  normalized = ensureRubyFurigana(normalized);
+  if (/<(?!\/?(?:ruby|rt)\b)[^>]+>/i.test(normalized)) return '';
+
+  let rubyCount = 0;
+  const outsideRuby = normalized.replace(
+    /<ruby>([\u4e00-\u9faf\u3400-\u4dbf々]+)<rt>([ぁ-んァ-ヶー]+)<\/rt><\/ruby>/gi,
+    (_full, base, reading) => {
+      if (!base.trim() || !reading.trim()) return _full;
+      rubyCount += 1;
+      return '';
+    }
+  );
+
+  if (/<\/?(?:ruby|rt)\b/i.test(outsideRuby)) return '';
+  if (/[\u4e00-\u9faf\u3400-\u4dbf]/.test(outsideRuby)) return '';
+  if (/[\u4e00-\u9faf\u3400-\u4dbf]/.test(normalized) && rubyCount === 0) return '';
+  return normalized;
+}
+
+async function repairAiFurigana({ apiKey, model, sentence }) {
+  const prompt = `Chuẩn hóa câu tiếng Nhật sau thành HTML ruby chính xác:\n${JSON.stringify(String(sentence || ''))}\n\nQuy tắc bắt buộc:\n- MỌI chữ Hán phải nằm trong <ruby>漢字<rt>かんじ</rt></ruby>.\n- Phần <rt> chỉ chứa Hiragana hoặc Katakana.\n- Nếu đầu vào bị dính cách đọc như \"財布さいふ\" hoặc \"残のこって\", hãy bỏ phần kana bị lặp và chuyển thành ruby đúng.\n- Giữ nguyên ý nghĩa và ngữ pháp của câu.\n- Chỉ trả JSON: {\"ex_ruby\":\"...\"}`;
+  const data = await callGeminiApi(apiKey, model, {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 512,
+      responseMimeType: 'application/json'
+    }
+  });
+  const responseText = (data?.candidates?.[0]?.content?.parts || [])
+    .filter((part) => !part.thought && part.text)
+    .map((part) => part.text)
+    .join('\n')
+    .replace(/^```json\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  try {
+    const parsed = JSON.parse(responseText);
+    return normalizeAndValidateAiFurigana(parsed.ex_ruby);
+  } catch (_) {
+    return '';
+  }
 }
 
 /**
@@ -1091,6 +1149,9 @@ Yêu cầu nghiêm ngặt:
 2. Xác định các từ loại của từ bằng TIẾNG ANH (ví dụ: Noun • Suru verb • Transitive verb, I-adjective...).
 3. Tạo 01 câu ví dụ tiếng Nhật tự nhiên, ngắn gọn, phù hợp ngữ cảnh từ.
 4. Câu ví dụ BẮT BUỘC phải có Furigana cho TẤT CẢ các chữ Hán trong câu, viết theo thẻ HTML ruby: <ruby>漢字<rt>かんじ</rt></ruby>.
+   - Không được viết cách đọc nối thẳng sau chữ Hán như "財布さいふ" hoặc "残のこって".
+   - Ví dụ đúng: <ruby>財布<rt>さいふ</rt></ruby>の<ruby>中<rt>なか</rt></ruby>には<ruby>僅<rt>わず</rt></ruby>かな<ruby>小銭<rt>こぜに</rt></ruby>しか<ruby>残<rt>のこ</rt></ruby>っていなかった。
+   - Ngoài thẻ <ruby> và <rt>, không dùng bất kỳ thẻ HTML nào khác trong "ex_ruby".
 5. Dịch câu ví dụ sang TIẾNG VIỆT chính xác, tự nhiên và sát nghĩa nhất.
 6. Chọn "sense_index" là số thứ tự 1-based của mục nghĩa trong "Nghĩa gốc tham khảo" mà câu ví dụ minh họa rõ nhất. Nếu không xác định chắc chắn, trả về null.
 7. Phân tích chi tiết các chữ Hán (Kanji) có trong từ: chữ Hán, âm Hán-Việt, âm On'yomi (Katakana), âm Kun'yomi (Hiragana), ý nghĩa Hán-Việt ngắn gọn.
@@ -1179,10 +1240,15 @@ BẮT BUỘC trả về kết quả dưới dạng JSON thuần túy (không kè
     }
 
     if (parsed) {
-      if (parsed.ex_ruby) {
-        parsed.ex_ruby = ensureRubyFurigana(parsed.ex_ruby);
-      } else if (parsed.ex_jp) {
-        parsed.ex_ruby = ensureRubyFurigana(parsed.ex_jp);
+      const rawExample = parsed.ex_ruby || parsed.ex_jp || '';
+      if (rawExample) {
+        parsed.ex_ruby = normalizeAndValidateAiFurigana(rawExample);
+        if (!parsed.ex_ruby) {
+          parsed.ex_ruby = await repairAiFurigana({ apiKey, model, sentence: rawExample });
+        }
+        if (!parsed.ex_ruby) {
+          throw new Error('Gemini trả về Furigana sai định dạng sau khi đã thử chuẩn hóa.');
+        }
       }
       return parsed;
     }
@@ -1234,7 +1300,10 @@ async function handleGeminiGenerate({ word, reading, definition, rawDefinitions 
 
   if (analysis && (analysis.ex_ruby || analysis.ex_jp)) {
     const rawRuby = analysis.ex_ruby || analysis.ex_jp;
-    const formattedRuby = ensureRubyFurigana(rawRuby);
+    const formattedRuby = normalizeAndValidateAiFurigana(rawRuby);
+    if (!formattedRuby) {
+      throw new Error('AI không thể tạo Furigana đúng định dạng. Vui lòng tạo lại câu khác.');
+    }
     const plainJp = formattedRuby.replace(/<rt>[^<]*<\/rt>/g, '').replace(/<\/?ruby>/g, '');
     const result = {
       ex_jp: plainJp,
@@ -1726,6 +1795,51 @@ function structuredJapaneseToHtml(node) {
   return inner;
 }
 
+/**
+ * Extract only glossary text. Jitendex nests example containers inside some
+ * glossary list items, so the generic text extractor would append the raw
+ * Japanese sentence and its translation to the meaning itself.
+ */
+function extractStructuredGlossText(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) {
+    return node.map(extractStructuredGlossText).filter(Boolean).join(' ');
+  }
+  if (typeof node !== 'object') return '';
+
+  const marker = getStructuredContentMarker(node);
+  if (/^(?:example|example-sentence)(?:-|$)/.test(marker) || marker === 'attribution') {
+    return '';
+  }
+  if (String(node.tag || '').toLowerCase() === 'rt') return '';
+  return extractStructuredGlossText(node.content);
+}
+
+function splitGlosses(value) {
+  return String(value || '')
+    .split(/\s*;\s*/)
+    .map((item) => item.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+function dedupeExamples(examples) {
+  const uniqueBySentence = new Map();
+  (examples || []).forEach((example) => {
+    const jp = String(example?.jp || '')
+      .replace(/<rt>[\s\S]*?<\/rt>/gi, '')
+      .replace(/<[^>]*>/g, '')
+      .replace(/\s+/g, '')
+      .trim();
+    if (!jp) return;
+    const existing = uniqueBySentence.get(jp);
+    if (!existing || (!existing.vi && example?.vi)) {
+      uniqueBySentence.set(jp, example);
+    }
+  });
+  return Array.from(uniqueBySentence.values());
+}
+
 async function extractStructuredExamples(senseNode) {
   const markerIs = (node, pattern) => pattern.test(getStructuredContentMarker(node));
   let containers = findStructuredNodes(
@@ -1747,7 +1861,7 @@ async function extractStructuredExamples(senseNode) {
       const vi = await translateExampleSentenceToVietnamese({ ja: plainJp, en: sourceTranslation });
       examples.push({ jp, vi });
     }
-    return examples;
+    return dedupeExamples(examples);
   }
 
   const examples = [];
@@ -1761,7 +1875,7 @@ async function extractStructuredExamples(senseNode) {
     const vi = await translateExampleSentenceToVietnamese({ ja: plainJp, en: sourceTranslation });
     examples.push({ jp, vi });
   }
-  return examples;
+  return dedupeExamples(examples);
 }
 
 async function parseStructuredDictionarySenses(rawDefinitions) {
@@ -1802,9 +1916,9 @@ async function parseStructuredDictionarySenses(rawDefinitions) {
       for (const glossaryNode of glossaryNodes) {
         const listItems = findStructuredNodes(glossaryNode, (node) => String(node.tag || '').toLowerCase() === 'li', true);
         const values = listItems.length > 0
-          ? listItems.map((node) => extractTextFromNode(node).trim())
-          : [extractTextFromNode(glossaryNode).trim()];
-        values.filter(Boolean).forEach((value) => {
+          ? listItems.map((node) => extractStructuredGlossText(node).trim())
+          : [extractStructuredGlossText(glossaryNode).trim()];
+        values.flatMap(splitGlosses).forEach((value) => {
           if (!glosses.includes(value)) glosses.push(value);
         });
       }
@@ -1827,6 +1941,7 @@ async function parseStructuredDictionarySenses(rawDefinitions) {
       senses.push({
         index: globalSenseIndex++,
         text: glosses.join('; '),
+        glosses,
         labels,
         examples,
         notes
@@ -1939,6 +2054,7 @@ async function parseDictionarySenses(rawHtml, rawDefinitions = null) {
           senses.push({
             index: globalSenseIndex++,
             text: defText,
+            glosses: splitGlosses(defText),
             labels: [],
             examples,
             notes
@@ -2009,6 +2125,7 @@ async function parseDictionarySenses(rawHtml, rawDefinitions = null) {
           senses.push({
             index: globalSenseIndex++,
             text: defText,
+            glosses: splitGlosses(defText),
             labels: [],
             examples: [],
             notes: ''
@@ -2075,6 +2192,7 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
       senses: aiMeanings.map((m, idx) => ({
         index: idx + 1,
         text: m,
+        glosses: splitGlosses(m),
         labels: [],
         examples: [],
         notes: ''
@@ -2104,11 +2222,11 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
 
   let aiExample = null;
   if (userAiEx) {
-    const aiJp = ensureRubyFurigana(userAiEx.jp || userAiEx.ex_ruby || userAiEx.ex_furigana);
+    const aiJp = normalizeAndValidateAiFurigana(userAiEx.jp || userAiEx.ex_ruby || userAiEx.ex_furigana);
     const aiVi = userAiEx.vi || userAiEx.ex_vi || '';
     const cleanAiJp = aiJp.replace(/<[^>]*>/g, '').trim();
 
-    if (!allDictJp.has(cleanAiJp)) {
+    if (aiJp && !allDictJp.has(cleanAiJp)) {
       aiExample = {
         title: '✨ Ví dụ AI · Gemini',
         jp: aiJp,
@@ -2117,9 +2235,9 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
       };
     }
   } else if (aiData?.ex_ruby) {
-    const aiJp = ensureRubyFurigana(aiData.ex_ruby);
+    const aiJp = normalizeAndValidateAiFurigana(aiData.ex_ruby);
     const cleanAiJp = aiJp.replace(/<[^>]*>/g, '').trim();
-    if (!allDictJp.has(cleanAiJp)) {
+    if (aiJp && !allDictJp.has(cleanAiJp)) {
       aiExample = {
         title: '✨ Ví dụ AI · Gemini',
         jp: aiJp,
@@ -2144,7 +2262,7 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
         ${isGeneral ? '✨ Ví dụ AI tổng quát · Gemini' : (example.title || '✨ Ví dụ AI · Gemini')}
       </div>
       <div class="example-jp" style="font-size:16px; font-weight:600; line-height:1.9; color:var(--lab-text, #1e293b); margin-bottom:4px;">
-        ${ensureRubyFurigana(example.jp)}
+        ${normalizeAndValidateAiFurigana(example.jp)}
       </div>
       ${example.vi ? `
       <div class="example-vi" style="font-size:13.5px; color:var(--lab-muted, #475569); font-style:italic; line-height:1.5;">
@@ -2181,6 +2299,16 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
     const sensesHtml = (g.senses.length > 0 ? g.senses : [{ index: 1, text: 'Definition', labels: [], examples: [], notes: '' }])
       .map(sense => {
         const senseAiExample = aiExample && aiExample.senseIndex === sense.index ? aiExample : null;
+        const senseGlosses = Array.isArray(sense.glosses) && sense.glosses.length > 0
+          ? sense.glosses
+          : splitGlosses(sense.text);
+        const meaningHtml = senseGlosses.length > 1
+          ? `<ul class="meaning-gloss-list" style="margin:0; padding-left:20px; font-size:16px; font-weight:600; color:var(--lab-text, #1e293b); line-height:1.55;">
+              ${senseGlosses.map((gloss) => `<li style="margin:1px 0; padding-left:2px;">${escapeHtml(gloss)}</li>`).join('')}
+            </ul>`
+          : `<span class="meaning-text" style="font-size:16px; font-weight:600; color:var(--lab-text, #1e293b); line-height:1.5;">
+              ${escapeHtml(senseGlosses[0] || sense.text)}
+            </span>`;
         return `
         <div class="lab-meaning-item" style="display:flex; flex-direction:column; gap:0; padding:10px 14px; background:var(--lab-surface, #ffffff); border:1px solid var(--lab-border, #e2e8f0); border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.03); margin-bottom:8px;">
           <div class="lab-meaning-row" style="display:flex; align-items:flex-start; gap:12px; width:100%;">
@@ -2192,9 +2320,7 @@ async function formatBeautifiedMeaningHtml({ aiData, rawDefinition, rawDefinitio
               <div class="sense-labels" style="display:flex; flex-wrap:wrap; gap:5px; margin-bottom:5px;">
                 ${sense.labels.map((label) => `<span style="display:inline-flex; align-items:center; padding:2px 7px; border-radius:999px; background:#f1f5f9; border:1px solid #cbd5e1; color:#475569; font-size:10.5px; font-weight:700;">${escapeHtml(label)}</span>`).join('')}
               </div>` : ''}
-              <span class="meaning-text" style="font-size:16px; font-weight:600; color:var(--lab-text, #1e293b); line-height:1.5;">
-                ${escapeHtml(sense.text)}
-              </span>
+              ${meaningHtml}
               ${sense.notes ? `
               <div class="sense-notes" style="font-size:12.5px; color:#64748b; margin-top:3px; font-style:italic;">
                 ${escapeHtml(sense.notes)}
